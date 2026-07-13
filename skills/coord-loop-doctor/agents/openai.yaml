@@ -1,0 +1,4 @@
+interface:
+  display_name: "Coord Loop Doctor"
+  short_description: "Diagnose stuck coord loops"
+  default_prompt: "Use $coord-loop-doctor to classify why this coord loop is stuck and recommend the smallest recovery action."

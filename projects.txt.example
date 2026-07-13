@@ -1,0 +1,12 @@
+# coord-wright — project registry.
+#
+# Copy this file to `projects.txt` (same directory) and list the ABSOLUTE
+# path of each repository the coord workers should run for, one per line.
+# Lines starting with `#` are comments. Re-run ./install.sh after editing.
+#
+# An empty/all-commented registry is valid — the workers simply have nothing
+# to run for until you add a path.
+#
+# Example (replace with your own absolute paths):
+#   /Users/you/Projects/my-app
+#   /Users/you/Projects/another-service

@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""Verify coord task artifacts declared by verify_profile."""
+
+import argparse
+import glob
+import hashlib
+import html
+import json
+import os
+from pathlib import Path
+import re
+import runpy
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
+
+
+ROOT = Path(__file__).resolve().parents[1]
+COORD = ROOT / "bin" / "coord"
+COORD_MODULE = runpy.run_path(str(COORD), run_name="coord_verify_import")
+VERIFY_PROFILES = {"html5", "pptx-html", "lab-brief"}
+
+
+def repo_root():
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        return Path(result.stdout.strip())
+    return Path.cwd()
+
+
+def normalize_text(text):
+    return " ".join((text or "").split())
+
+
+def task_data(task_id):
+    find_task = COORD_MODULE["find_task"]
+    parse_task = COORD_MODULE["parse_task"]
+    path = find_task(task_id)
+    if not path:
+        raise SystemExit(f"task not found: {task_id}")
+    fm, body = parse_task(path)
+    return Path(path), fm, body
+
+
+def scope_candidates(fm, body):
+    coerce_str_list = COORD_MODULE["coerce_str_list"]
+    get_section = COORD_MODULE["get_section"]
+    parts = []
+    parts.extend(coerce_str_list(fm.get("scope")))
+    scope = get_section(body, "Scope notes") or get_section(body, "Scope") or ""
+    parts.extend(re.findall(r"`([^`]+\.(?:html?|pptx))`", scope, flags=re.I))
+    parts.extend(re.findall(r"(?<![\w./-])([A-Za-z0-9_./-]+\.(?:html?|pptx))(?![\w./-])", scope, flags=re.I))
+    return parts
+
+
+def resolve_scoped_files(fm, body, suffixes):
+    root = repo_root()
+    paths = []
+    for raw in scope_candidates(fm, body):
+        item = str(raw).strip()
+        if not item:
+            continue
+        if item.startswith("file/"):
+            item = item[5:]
+        candidate = Path(item)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        matches = []
+        if any(ch in str(candidate) for ch in "*?["):
+            matches = [Path(p) for p in glob.glob(str(candidate), recursive=True)]
+        elif candidate.is_dir():
+            for suffix in suffixes:
+                matches.extend(candidate.rglob(f"*{suffix}"))
+        elif candidate.exists():
+            matches = [candidate]
+        for path in matches:
+            if path.is_file() and path.suffix.lower() in suffixes:
+                paths.append(path.resolve())
+    seen = set()
+    result = []
+    for path in paths:
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            result.append(path)
+    return result
+
+
+def ensure_vnu():
+    exe = shutil.which("vnu")
+    if exe:
+        return exe
+    raise RuntimeError("Nu Html Checker 'vnu' not found; install via 'brew install vnu'. Apple /usr/bin/tidy is not accepted for HTML5")
+
+
+def verify_html(files, missing_vnu_is_error=True):
+    if not files:
+        return ["no scoped HTML files found"]
+    try:
+        vnu = ensure_vnu()
+    except RuntimeError as exc:
+        if missing_vnu_is_error:
+            return [str(exc)]
+        return []
+    result = subprocess.run(
+        [vnu, *map(str, files)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        output = (result.stdout + result.stderr).strip()
+        return [f"vnu failed for scoped HTML files:\n{output}"]
+    return []
+
+
+def pptx_slide_count(path):
+    with zipfile.ZipFile(path) as zf:
+        return len([name for name in zf.namelist() if re.match(r"ppt/slides/slide\d+\.xml$", name)])
+
+
+def pptx_text_markitdown(path):
+    exe = shutil.which("markitdown")
+    if not exe:
+        return ""
+    result = subprocess.run([exe, str(path)], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return ""
+    return result.stdout
+
+
+def pptx_text_zip(path):
+    chunks = []
+    with zipfile.ZipFile(path) as zf:
+        for name in sorted(zf.namelist()):
+            if not re.match(r"ppt/slides/slide\d+\.xml$", name):
+                continue
+            raw = zf.read(name).decode("utf-8", errors="ignore")
+            chunks.extend(html.unescape(match) for match in re.findall(r"<a:t[^>]*>(.*?)</a:t>", raw, flags=re.S))
+    return "\n".join(chunks)
+
+
+def pptx_fingerprint(path):
+    slide_count = pptx_slide_count(path)
+    text = normalize_text(pptx_text_markitdown(path) or pptx_text_zip(path))
+    return {
+        "path": str(path),
+        "slide_count": slide_count,
+        "text_chars": len(text),
+        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    }
+
+
+def baseline_path(task_id, path):
+    rel = os.path.relpath(path, repo_root())
+    digest = hashlib.sha256(rel.encode("utf-8")).hexdigest()[:16]
+    return repo_root() / ".coord" / "artifact-baselines" / task_id / f"{digest}.json"
+
+
+def capture_pptx_baselines(task_id, files):
+    written = []
+    for path in files:
+        dest = baseline_path(task_id, path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        payload = pptx_fingerprint(path)
+        payload["relative_path"] = os.path.relpath(path, repo_root())
+        dest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        written.append(dest)
+    return written
+
+
+def render_pptx_if_available(path):
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    pdftoppm = shutil.which("pdftoppm")
+    if not soffice or not pdftoppm:
+        return []
+    with tempfile.TemporaryDirectory(prefix="coord-verify-render-") as tmp:
+        tmpdir = Path(tmp)
+        result = subprocess.run(
+            [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(tmpdir), str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return [f"LibreOffice render failed for {path}: {(result.stdout + result.stderr).strip()}"]
+        pdfs = list(tmpdir.glob("*.pdf"))
+        if not pdfs:
+            return [f"LibreOffice render produced no PDF for {path}"]
+        result = subprocess.run(
+            [pdftoppm, "-png", "-f", "1", "-singlefile", str(pdfs[0]), str(tmpdir / "page")],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0 or not (tmpdir / "page.png").exists():
+            return [f"pdftoppm render failed for {path}: {(result.stdout + result.stderr).strip()}"]
+    return []
+
+
+def verify_pptx(task_id, files):
+    errors = []
+    if not files:
+        return ["no scoped PPTX files found"]
+    for path in files:
+        try:
+            current = pptx_fingerprint(path)
+        except Exception as exc:
+            errors.append(f"{path}: unreadable PPTX package: {exc}")
+            continue
+        base_file = baseline_path(task_id, path)
+        if base_file.exists():
+            baseline = json.loads(base_file.read_text(encoding="utf-8"))
+            if current["slide_count"] < int(baseline.get("slide_count", 0)):
+                errors.append(
+                    f"{path}: slide count dropped {baseline.get('slide_count')} -> {current['slide_count']}"
+                )
+            baseline_chars = int(baseline.get("text_chars", 0) or 0)
+            if baseline_chars >= 100 and current["text_chars"] < int(baseline_chars * 0.65):
+                errors.append(
+                    f"{path}: extracted text dropped {baseline_chars} -> {current['text_chars']} chars"
+                )
+        if current["slide_count"] <= 0:
+            errors.append(f"{path}: no slides found")
+        errors.extend(render_pptx_if_available(path))
+    return errors
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="coord-verify-artifacts")
+    parser.add_argument("id")
+    parser.add_argument("--profile")
+    parser.add_argument("--capture-baseline", action="store_true")
+    args = parser.parse_args()
+
+    _path, fm, body = task_data(args.id)
+    profile = args.profile or fm.get("verify_profile")
+    if not profile:
+        print("no verify_profile declared")
+        return
+    if profile not in VERIFY_PROFILES:
+        raise SystemExit(f"unknown verify_profile: {profile}")
+
+    html_files = resolve_scoped_files(fm, body, {".html", ".htm"})
+    pptx_files = resolve_scoped_files(fm, body, {".pptx"})
+
+    if args.capture_baseline:
+        written = capture_pptx_baselines(args.id, pptx_files)
+        print(f"captured {len(written)} PPTX baseline(s)")
+        return
+
+    errors = []
+    if profile == "html5":
+        errors.extend(verify_html(html_files, missing_vnu_is_error=True))
+    elif profile == "lab-brief":
+        errors.extend(verify_html(html_files, missing_vnu_is_error=False))
+    elif profile == "pptx-html":
+        if html_files:
+            errors.extend(verify_html(html_files, missing_vnu_is_error=True))
+        errors.extend(verify_pptx(args.id, pptx_files))
+
+    if errors:
+        print("artifact verification failed:")
+        for error in errors:
+            print(f"- {error}")
+        raise SystemExit(3)
+    print(f"artifact verification passed: {profile}")
+
+
+if __name__ == "__main__":
+    main()

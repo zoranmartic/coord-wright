@@ -1,0 +1,58 @@
+#!/bin/sh
+set -eu
+
+start_dir=${1:-$PWD}
+
+git_top=$(git -C "$start_dir" rev-parse --show-toplevel 2>/dev/null) || {
+  echo "coord-project-root: not inside a git worktree: $start_dir" >&2
+  exit 2
+}
+
+config_file="$git_top/.coord/config.env"
+if [ -f "$config_file" ]; then
+  repo_root=$(
+    awk -F= '
+      $1 == "COORD_REPO_ROOT" {
+        val = $2
+        gsub(/^[ \t"'"'"']+|[ \t"'"'"']+$/, "", val)
+        print val
+        exit
+      }
+    ' "$config_file"
+  )
+  if [ -n "${repo_root:-}" ]; then
+    if [ -d "$repo_root" ]; then
+      cd "$repo_root"
+      pwd -P
+      exit 0
+    fi
+    echo "coord-project-root: COORD_REPO_ROOT does not exist: $repo_root" >&2
+    exit 2
+  fi
+fi
+
+main_roots=$(
+  git -C "$git_top" worktree list --porcelain |
+    awk '
+      /^worktree / { wt = substr($0, 10) }
+      /^branch refs\/heads\/main$/ { print wt }
+    '
+)
+
+count=$(printf "%s\n" "$main_roots" | sed '/^$/d' | wc -l | tr -d ' ')
+case "$count" in
+  1)
+    main_root=$(printf "%s\n" "$main_roots" | sed '/^$/d')
+    cd "$main_root"
+    pwd -P
+    ;;
+  0)
+    echo "coord-project-root: could not find a main worktree from $git_top" >&2
+    exit 2
+    ;;
+  *)
+    echo "coord-project-root: multiple main worktrees found from $git_top" >&2
+    printf "%s\n" "$main_roots" >&2
+    exit 2
+    ;;
+esac

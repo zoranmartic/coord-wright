@@ -1,0 +1,85 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git branch*)",
+      "Bash(git add*)",
+      "Bash(git commit*)",
+      "Bash(git push*)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(rg *)",
+      "Bash(find:*)",
+      "Bash(sed:*)",
+      "Bash(grep:*)",
+      "Bash(env)",
+      "Bash(mkdir -p *)",
+      "Bash(python3 __COORD_TOOLS__/bin/coord *)",
+      "Bash(python3 bin/coord *)",
+      "Bash(python3 -m unittest discover -s tests*)",
+      "Bash(python3 -m unittest tests*)",
+      "Bash(python3 -m pytest tests*)",
+      "Bash(coord*)",
+      "Bash(__COORD_TOOLS__/bin/*)",
+      "Bash(bash __COORD_TOOLS__/bin/*)",
+      "Bash(git -C *)",
+      "Skill(coord-run)",
+      "Skill(coord-check)",
+      "Skill(coord-status)",
+      "Skill(coord-tokens)",
+      "Write(//tmp/**)",
+      "Write(__HOME__/Projects/*/.coord/**)"
+    ],
+    "additionalDirectories": [
+      "__HOME__/.claude"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__COORD_TOOLS__/hooks/session-start.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__COORD_TOOLS__/hooks/pretooluse-bash.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__COORD_TOOLS__/hooks/pretooluse-edit-write.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__COORD_TOOLS__/hooks/posttooluse-py-typecheck.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

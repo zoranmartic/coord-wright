@@ -1,0 +1,4 @@
+interface:
+  display_name: "Coord Archive Index"
+  short_description: "Index coord task archives"
+  default_prompt: "Use $coord-archive-index to generate a searchable index for this project's coord archive."

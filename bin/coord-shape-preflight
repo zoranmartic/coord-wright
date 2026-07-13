@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""coord-shape-preflight — mechanical preflight for coord-shape-review.
+
+Runs deterministic shape checks before any paid Codex round. Exits 0 with no
+output when clean. Exits 1 and prints one finding per line in the form
+"CODE: details" when issues are found.
+
+The downstream coord-shape-review skill reads stdout and surfaces findings to
+the user. Advisory codes (PREFLIGHT_RENDERER_HANDOFF_INCOMPLETE,
+PREFLIGHT_SCOPE_PATH_NOT_FOUND) do NOT cause exit 1 on their own — they print
+to stderr as "ADVISORY: CODE: details" and exit 0.
+
+Hard finding codes (any one causes exit 1):
+  PREFLIGHT_MISSING_ACCEPTANCE       — no acceptance frontmatter list,
+                                       verify_commands, verify_profile, or
+                                       concrete `## Acceptance test` body
+  PREFLIGHT_MISSING_VERIFY           — acceptance present but neither
+                                       verify_commands nor verify_profile
+                                       (only enforced when the task body has
+                                       no concrete acceptance section either)
+  PREFLIGHT_MALFORMED_SCOPE          — at least one scope entry violates
+                                       the grammar
+  PREFLIGHT_DEPENDS_ON_MISSING_FILE  — depends_on id has no task file
+  PREFLIGHT_SUBTASKS_UNPARSEABLE     — subtask block has unparseable entries
+
+Advisory codes (exit 0; written to stderr):
+  PREFLIGHT_RENDERER_HANDOFF_INCOMPLETE  — frontmatter acceptance is empty
+                                           but the task has subtasks; the
+                                           handoff renderer needs the
+                                           frontmatter list to render fully
+  PREFLIGHT_SCOPE_PATH_NOT_FOUND          — a non-glob scope entry does not
+                                           exist on disk and is not listed
+                                           in scope_creates
+
+Usage:
+  coord-shape-preflight <task-file>
+  coord-shape-preflight --project-root <root> <task-id>
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from pathlib import Path
+
+# Match Markdown frontmatter delimited by lines containing only ---
+FRONTMATTER_RE = re.compile(r"^---\n(.*?\n)---\n(.*)\Z", re.DOTALL)
+SUBTASK_RE = re.compile(r"^- \[[ x]\] \*\*S\d+:", re.MULTILINE)
+SECTION_RE_TPL = r"^#+\s*{heading}\s*$"
+
+# Scope grammar (round 4 settled spec):
+SCOPE_ALLOWED_CHARS = re.compile(r"^[A-Za-z0-9_./@*+=()\[\]-]+$")
+SCOPE_DISALLOWED_SUBSTR = ("..", ";", "{", "}", "\\", "\t")
+
+
+def parse_frontmatter(content: str) -> tuple[dict, str]:
+    """Return (frontmatter dict, body string). Hand-roll a minimal YAML parser
+    sufficient for coord task frontmatter (scalars, sequences, simple maps).
+    """
+    m = FRONTMATTER_RE.match(content)
+    if not m:
+        return {}, content
+    raw_fm, body = m.group(1), m.group(2)
+
+    fm: dict = {}
+    current_key: str | None = None
+    for line in raw_fm.splitlines():
+        if not line.strip():
+            continue
+        if line.startswith(("  - ", "- ")):
+            # list item
+            value = line.split("-", 1)[1].strip()
+            if current_key is None:
+                continue
+            existing = fm.get(current_key)
+            if not isinstance(existing, list):
+                fm[current_key] = []
+            fm[current_key].append(value)
+        elif ":" in line and not line.startswith(" "):
+            key, _, val = line.partition(":")
+            key = key.strip()
+            val = val.strip()
+            current_key = key
+            if val == "":
+                fm[key] = []  # could be a list starting on next lines
+            else:
+                # Strip quotes for scalars
+                if val.startswith('"') and val.endswith('"'):
+                    val = val[1:-1]
+                fm[key] = val
+        elif line.startswith("  "):
+            # map sub-entry or continuation; treat as map under current_key
+            existing = fm.get(current_key)
+            if isinstance(existing, list) and not existing:
+                fm[current_key] = {}
+            if isinstance(fm.get(current_key), dict):
+                if ":" in line:
+                    sub_k, _, sub_v = line.partition(":")
+                    fm[current_key][sub_k.strip()] = sub_v.strip()
+    return fm, body
+
+
+def section_text(body: str, heading: str) -> str:
+    pattern = re.compile(SECTION_RE_TPL.format(heading=re.escape(heading)),
+                         re.IGNORECASE | re.MULTILINE)
+    m = pattern.search(body)
+    if not m:
+        return ""
+    start = m.end()
+    next_h = re.search(r"^#+\s", body[start:], re.MULTILINE)
+    end = start + next_h.start() if next_h else len(body)
+    return body[start:end].strip()
+
+
+def is_concrete_section(text: str) -> bool:
+    text = (text or "").strip()
+    if not text:
+        return False
+    if text.startswith("_") and text.endswith("_") and len(text) < 80:
+        return False  # placeholder italic line
+    return True
+
+
+def check_acceptance_and_verify(fm: dict, body: str,
+                                hard: list, advisory: list) -> None:
+    acceptance = fm.get("acceptance") or []
+    if isinstance(acceptance, str):
+        acceptance = [acceptance] if acceptance.strip() else []
+    verify_commands = fm.get("verify_commands") or []
+    if isinstance(verify_commands, str):
+        verify_commands = [verify_commands] if verify_commands.strip() else []
+    verify_profile = (fm.get("verify_profile") or "").strip() if isinstance(
+        fm.get("verify_profile"), str) else ""
+
+    acceptance_section = section_text(body, "Acceptance test") or \
+        section_text(body, "Acceptance")
+    has_concrete_body = is_concrete_section(acceptance_section)
+
+    has_any = bool(acceptance) or bool(verify_commands) or bool(
+        verify_profile) or has_concrete_body
+    if not has_any:
+        hard.append(("PREFLIGHT_MISSING_ACCEPTANCE",
+                     "no acceptance frontmatter, verify_commands, "
+                     "verify_profile, or concrete Acceptance test body"))
+        return
+
+    # Advisory: empty frontmatter acceptance but body present and task has
+    # subtasks (i.e. it's runnable). The handoff renderer needs the
+    # frontmatter list to render fully.
+    scope_notes = section_text(body, "Scope notes") or \
+        section_text(body, "Scope")
+    has_subtasks = bool(SUBTASK_RE.search(scope_notes))
+    if not acceptance and has_concrete_body and has_subtasks:
+        advisory.append(("PREFLIGHT_RENDERER_HANDOFF_INCOMPLETE",
+                         "frontmatter `acceptance:` is empty but body "
+                         "section is present; `coord show --handoff` "
+                         "renders only frontmatter — add the list"))
+
+    # Hard: if acceptance frontmatter is present but no verify is configured
+    # AND no concrete body section, flag MISSING_VERIFY. (When concrete body
+    # is present, verify is considered optional — docs/review tasks fit here.)
+    if acceptance and not verify_commands and not verify_profile and \
+            not has_concrete_body:
+        hard.append(("PREFLIGHT_MISSING_VERIFY",
+                     "frontmatter `acceptance:` present but no "
+                     "`verify_commands:` or `verify_profile:` and no "
+                     "concrete `## Acceptance test` body"))
+
+
+def check_scope_grammar(fm: dict, project_root: Path,
+                       hard: list, advisory: list) -> None:
+    scope_entries = fm.get("scope") or []
+    if isinstance(scope_entries, str):
+        scope_entries = [scope_entries]
+    scope_creates = fm.get("scope_creates") or []
+    if isinstance(scope_creates, str):
+        scope_creates = [scope_creates]
+    scope_creates_set = {e.strip() for e in scope_creates}
+
+    for entry in scope_entries:
+        entry = entry.strip()
+        if not entry:
+            continue
+        # length check
+        if len(entry) < 2:
+            hard.append(("PREFLIGHT_MALFORMED_SCOPE",
+                         f"entry too short: {entry!r}"))
+            continue
+        # leading slash
+        if entry.startswith("/"):
+            hard.append(("PREFLIGHT_MALFORMED_SCOPE",
+                         f"absolute path not allowed: {entry!r}"))
+            continue
+        # disallowed substrings
+        bad = next((s for s in SCOPE_DISALLOWED_SUBSTR if s in entry), None)
+        if bad:
+            hard.append(("PREFLIGHT_MALFORMED_SCOPE",
+                         f"contains disallowed substring {bad!r}: {entry!r}"))
+            continue
+        # whitespace
+        if any(ch.isspace() for ch in entry):
+            hard.append(("PREFLIGHT_MALFORMED_SCOPE",
+                         f"contains whitespace: {entry!r}"))
+            continue
+        # bare wildcard
+        if entry == "*":
+            hard.append(("PREFLIGHT_MALFORMED_SCOPE",
+                         "bare `*` entry is too broad"))
+            continue
+        # char class
+        if not SCOPE_ALLOWED_CHARS.match(entry):
+            hard.append(("PREFLIGHT_MALFORMED_SCOPE",
+                         f"contains disallowed characters: {entry!r}"))
+            continue
+
+        # Advisory: existence check for non-glob entries not in scope_creates
+        has_glob = "*" in entry
+        if not has_glob and entry not in scope_creates_set:
+            full_path = project_root / entry
+            if not full_path.exists():
+                advisory.append(("PREFLIGHT_SCOPE_PATH_NOT_FOUND",
+                                 f"scope path does not exist and is not in "
+                                 f"`scope_creates:`: {entry!r}"))
+
+
+def _resolve_task_dirs(project_root: Path) -> list[Path]:
+    """Return the ordered list of directories to search for dependency
+    task files, using `coord paths --json` so configurable task locations
+    (COORD_TASKS_DIR, project config.env, alternate layouts) work.
+
+    Fall back to `tasks/` + `tasks/archive/` if `coord paths` is unavailable
+    (very old coord-wright) or returns no usable data.
+    """
+    import json
+    import subprocess
+
+    here = Path(__file__).resolve().parent
+    coord = here / "coord"
+    if not coord.exists():
+        return [project_root / "tasks", project_root / "tasks" / "archive"]
+
+    try:
+        out = subprocess.check_output(
+            [str(coord), "paths", "--json"],
+            cwd=str(project_root),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        cfg = json.loads(out)
+    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError):
+        return [project_root / "tasks", project_root / "tasks" / "archive"]
+
+    dirs: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(rel: str) -> None:
+        if not rel:
+            return
+        full = (project_root / rel).resolve()
+        key = str(full)
+        if key not in seen:
+            seen.add(key)
+            dirs.append(full)
+
+    for rel in cfg.get("active_read_dirs") or []:
+        _add(rel)
+    _add(cfg.get("tasks_dir") or "")
+    for rel in cfg.get("archive_read_dirs") or []:
+        _add(rel)
+    _add(cfg.get("archive_dir") or "")
+    _add(cfg.get("legacy_tasks_dir") or "")
+    _add(cfg.get("legacy_archive_dir") or "")
+
+    return dirs or [project_root / "tasks", project_root / "tasks" / "archive"]
+
+
+def check_depends_on(fm: dict, project_root: Path, hard: list) -> None:
+    deps = fm.get("depends_on") or []
+    if isinstance(deps, str):
+        deps = [deps]
+    task_dirs = _resolve_task_dirs(project_root)
+    for dep in deps:
+        dep = dep.strip()
+        if not dep:
+            continue
+        if not any((d / f"{dep}.md").exists() for d in task_dirs):
+            hard.append(("PREFLIGHT_DEPENDS_ON_MISSING_FILE",
+                         f"depends_on id has no task file: {dep!r}"))
+
+
+def check_subtasks(body: str, hard: list) -> None:
+    scope_notes = section_text(body, "Scope notes") or \
+        section_text(body, "Scope")
+    if not scope_notes:
+        return  # no subtasks expected (brainstorm or pre-shape)
+    # Each subtask checkbox line should also have complexity/model_claude/model_codex
+    subtask_starts = [m.start() for m in SUBTASK_RE.finditer(scope_notes)]
+    for i, start in enumerate(subtask_starts):
+        end = subtask_starts[i + 1] if i + 1 < len(subtask_starts) else len(scope_notes)
+        block = scope_notes[start:end]
+        for required in ("complexity:", "model_claude:", "model_codex:"):
+            if required not in block:
+                hard.append(("PREFLIGHT_SUBTASKS_UNPARSEABLE",
+                             f"subtask block missing required metadata "
+                             f"{required!r}: {block.splitlines()[0]}"))
+                break
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="coord-shape-preflight")
+    ap.add_argument("target", help="task id or path to task .md file")
+    ap.add_argument("--project-root",
+                    help="canonical project root (default: cwd or "
+                         "coord-project-root)")
+    args = ap.parse_args()
+
+    # Resolve target
+    target = args.target
+    project_root: Path
+    if args.project_root:
+        project_root = Path(args.project_root).resolve()
+    else:
+        # Try coord-project-root tool, else cwd
+        here = Path(__file__).resolve().parent
+        proj_tool = here / "coord-project-root"
+        if proj_tool.exists():
+            import subprocess
+            try:
+                project_root = Path(subprocess.check_output(
+                    [str(proj_tool)], text=True).strip()).resolve()
+            except subprocess.CalledProcessError:
+                project_root = Path.cwd()
+        else:
+            project_root = Path.cwd()
+
+    if os.path.isabs(target) or target.endswith(".md"):
+        task_file = Path(target).resolve()
+    else:
+        task_file = None
+        for d in _resolve_task_dirs(project_root):
+            candidate = d / f"{target}.md"
+            if candidate.exists():
+                task_file = candidate
+                break
+        if task_file is None:
+            # use the first dir for the "not found" error path
+            task_file = _resolve_task_dirs(project_root)[0] / f"{target}.md"
+
+    if not task_file.exists():
+        print(f"coord-shape-preflight: task file not found: {task_file}",
+              file=sys.stderr)
+        return 2
+
+    content = task_file.read_text(encoding="utf-8")
+    fm, body = parse_frontmatter(content)
+
+    hard: list = []
+    advisory: list = []
+    check_acceptance_and_verify(fm, body, hard, advisory)
+    check_scope_grammar(fm, project_root, hard, advisory)
+    check_depends_on(fm, project_root, hard)
+    check_subtasks(body, hard)
+
+    for code, details in hard:
+        print(f"{code}: {details}")
+    for code, details in advisory:
+        print(f"ADVISORY: {code}: {details}", file=sys.stderr)
+
+    return 1 if hard else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

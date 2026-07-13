@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""coord-review: validate a shaped coord task file against shaping quality checks.
+
+Usage:
+    coord-review <task-file-path>
+
+Exit codes:
+    0  All checks pass
+    1  One or more objections raised
+    2  Usage error / file not found
+
+Checks:
+  1. Shaping bar   — plan, acceptance, subtasks
+  2. Combo check   — complexity + reasoning_effort must be a known valid pair
+  3. Model check   — model_claude / model_codex must be on the allowlist
+  4. High-risk     — tasks with money/auth/security/destructive keywords must be
+                     complex + review_rounds_max >= 2
+"""
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+CLAUDE_MODEL_ALLOWLIST = {"haiku", "sonnet", "opus"}
+CODEX_MODEL_ALLOWLIST = {"gpt-5.6-sol", "gpt-5.5", "gpt-5.3-codex-spark"}
+CLAUDE_FULL_ID_PREFIX = "claude-"
+
+HIGH_RISK_KEYWORDS = re.compile(
+    r"\b(money|auth|security|destructive|trading|rca|migration)\b",
+    re.IGNORECASE,
+)
+
+VALID_COMBOS: set[tuple[str, str]] = {
+    ("trivial", "low"),
+    ("trivial", "medium"),
+    ("simple", "low"),
+    ("simple", "medium"),
+    ("simple", "high"),
+    ("complex", "medium"),
+    ("complex", "high"),
+    ("complex", "xhigh"),
+}
+
+SUBTASK_RE = re.compile(r"^\s*-\s*\[[ x]\]\s*\*\*S\d+:", re.MULTILINE)
+
+
+# ── minimal frontmatter parser (mirrors coord's _parse_fm) ──────────────────
+
+def _scalar(s: str):
+    if s in ("", "~", "null"):
+        return None
+    if s == "true":
+        return True
+    if s == "false":
+        return False
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        return s[1:-1]
+    return s
+
+
+def _parse_fm(text: str) -> dict:
+    lines = text.splitlines()
+    result: dict = {}
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not line or (not line[0].isalpha() and line[0] != "_"):
+            i += 1
+            continue
+        m = re.match(r"^([\w_][\w_-]*)\s*:\s*(.*)", line)
+        if not m:
+            i += 1
+            continue
+        key, val_raw = m.group(1), m.group(2).strip()
+
+        j = i + 1
+        children = []
+        while j < len(lines):
+            if lines[j] and lines[j][0] != " ":
+                break
+            children.append(lines[j])
+            j += 1
+
+        non_empty = [c for c in children if c.strip()]
+        if non_empty:
+            if re.match(r"^\s+-\s", non_empty[0]):
+                result[key] = [re.sub(r"^\s+-\s", "", c) for c in non_empty if c.strip()]
+            else:
+                mapping: dict = {}
+                for c in non_empty:
+                    mm = re.match(r"^\s+([\w_][\w_-]*)\s*:\s*(.*)", c)
+                    if mm:
+                        mapping[mm.group(1)] = _scalar(mm.group(2).strip())
+                result[key] = mapping
+            i = j
+        else:
+            result[key] = _scalar(val_raw)
+            i += 1
+    return result
+
+
+def _parse_task(path: Path) -> tuple[dict, str]:
+    text = path.read_text(encoding="utf-8")
+    parts = re.split(r"^---[ \t]*\n", text, maxsplit=2, flags=re.MULTILINE)
+    if len(parts) < 3:
+        return {}, text
+    return _parse_fm(parts[1]), parts[2]
+
+
+# ── section extractor ────────────────────────────────────────────────────────
+
+def _section(body: str, heading: str) -> str:
+    pattern = re.compile(
+        rf"^#+\s*{re.escape(heading)}\s*$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    m = pattern.search(body)
+    if not m:
+        return ""
+    start = m.end()
+    next_heading = re.search(r"^#+\s", body[start:], re.MULTILINE)
+    end = start + next_heading.start() if next_heading else len(body)
+    return body[start:end].strip()
+
+
+# ── checks ───────────────────────────────────────────────────────────────────
+
+def check_shaping_bar(front: dict, body: str) -> list[str]:
+    objections = []
+
+    plan = _section(body, "Plan")
+    placeholder = plan.lower() in {
+        "",
+        "_to be filled by architect or shaping session._",
+        "_fill me in._",
+    }
+    if not plan or placeholder:
+        objections.append("Plan section is missing or still a placeholder.")
+
+    acceptance = front.get("acceptance")
+    if not acceptance:
+        acceptance_section = _section(body, "Acceptance test") or _section(body, "Acceptance")
+        if not acceptance_section or acceptance_section.startswith("_"):
+            objections.append(
+                "Acceptance test is missing — add an `acceptance:` frontmatter list "
+                "or a non-empty ## Acceptance test section."
+            )
+
+    scope_notes = _section(body, "Scope notes")
+    if not SUBTASK_RE.search(scope_notes):
+        objections.append(
+            "Scope notes has no parseable subtasks. "
+            "Add at least one `- [ ] **S1: Title**` checkbox with "
+            "`complexity:`, `model_claude:`, and `model_codex:` metadata lines."
+        )
+
+    return objections
+
+
+def check_combo(front: dict) -> list[str]:
+    objections = []
+    complexity = str(front.get("complexity") or "").strip().lower()
+    effort = str(front.get("reasoning_effort") or "").strip().lower()
+    if complexity and effort:
+        if (complexity, effort) not in VALID_COMBOS:
+            objections.append(
+                f"Complexity/reasoning_effort combo `{complexity}+{effort}` is not valid. "
+                f"Valid pairs: {', '.join(f'{c}+{r}' for c, r in sorted(VALID_COMBOS))}."
+            )
+    elif complexity and not effort:
+        objections.append(
+            f"Task has `complexity: {complexity}` but no `reasoning_effort`. Add `reasoning_effort`."
+        )
+    return objections
+
+
+def check_models(front: dict) -> list[str]:
+    objections = []
+    model_claude = str(front.get("model_claude") or "").strip().lower()
+    model_codex = str(front.get("model_codex") or "").strip().lower()
+
+    if model_claude and model_claude not in CLAUDE_MODEL_ALLOWLIST and not model_claude.startswith(CLAUDE_FULL_ID_PREFIX):
+        objections.append(
+            f"`model_claude: {model_claude}` is not on the allowlist. "
+            f"Use one of: {', '.join(sorted(CLAUDE_MODEL_ALLOWLIST))}, or a full `claude-*` model ID."
+        )
+    if model_codex and model_codex not in CODEX_MODEL_ALLOWLIST:
+        objections.append(
+            f"`model_codex: {model_codex}` is not on the allowlist. "
+            f"Use one of: {', '.join(sorted(CODEX_MODEL_ALLOWLIST))}."
+        )
+    return objections
+
+
+def check_high_risk(front: dict) -> list[str]:
+    objections = []
+    task_text = str(front.get("task") or "")
+    tags = " ".join(str(t) for t in (front.get("tags") or []))
+    combined = f"{task_text} {tags}"
+
+    if not HIGH_RISK_KEYWORDS.search(combined):
+        return []
+
+    complexity = str(front.get("complexity") or "").strip().lower()
+    review_rounds = front.get("review_rounds_max")
+
+    if complexity != "complex":
+        objections.append(
+            "Task description or tags contain high-risk keywords "
+            f"({HIGH_RISK_KEYWORDS.pattern}) but `complexity` is not `complex`. "
+            "High-risk tasks must use `complexity: complex`."
+        )
+    rr = int(review_rounds) if review_rounds is not None else 0
+    if rr < 2:
+        objections.append(
+            "Task description or tags contain high-risk keywords "
+            f"({HIGH_RISK_KEYWORDS.pattern}) but `review_rounds_max` is < 2. "
+            "Set `review_rounds_max: 2` or higher."
+        )
+    return objections
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("Usage: coord-review <task-file-path>", file=sys.stderr)
+        return 2
+
+    path = Path(sys.argv[1])
+    if not path.exists():
+        print(f"Error: file not found: {path}", file=sys.stderr)
+        return 2
+
+    try:
+        front, body = _parse_task(path)
+    except Exception as exc:
+        print(f"Error: could not parse task file: {exc}", file=sys.stderr)
+        return 2
+
+    all_objections: list[str] = []
+    all_objections.extend(check_shaping_bar(front, body))
+    all_objections.extend(check_combo(front))
+    all_objections.extend(check_models(front))
+    all_objections.extend(check_high_risk(front))
+
+    if not all_objections:
+        print("LGTM — no shaping objections found.")
+        return 0
+
+    print(f"{len(all_objections)} shaping objection(s):")
+    for i, obj in enumerate(all_objections, 1):
+        print(f"  {i}. {obj}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

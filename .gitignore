@@ -1,0 +1,10 @@
+.semaphore/
+.venv/
+__pycache__/
+.pytest_cache/
+projects.txt
+.coord/*
+!.coord/handoffs/
+.claude/
+*.code-workspace
+.playwright-mcp/

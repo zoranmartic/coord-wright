@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""Report dirty coord project worktrees and the most likely active owner."""
+
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+
+TOOLS = os.environ.get("COORD_TOOLS") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECTS_FILE = os.path.join(TOOLS, "projects.txt")
+WORKING_STATUSES = {"claude-working", "codex-working"}
+INTERESTING_STATUSES = WORKING_STATUSES | {
+    "pending",
+    "needs-review",
+    "needs-brainstorming",
+}
+
+
+def run(cmd, cwd=None):
+    return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
+
+
+def safe_label(path):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(path.rstrip(os.sep)))
+
+
+def load_projects():
+    projects = []
+    if not os.path.exists(PROJECTS_FILE):
+        return projects
+    with open(PROJECTS_FILE, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if line and not line.startswith("#"):
+                projects.append(os.path.abspath(os.path.expanduser(line.rstrip("/"))))
+    return projects
+
+
+def current_project_root():
+    helper = os.path.join(TOOLS, "bin", "coord-project-root")
+    r = run([helper])
+    if r.returncode == 0 and r.stdout.strip():
+        return os.path.abspath(r.stdout.strip())
+    return None
+
+
+def select_projects(args):
+    projects = load_projects()
+    if args.all_projects:
+        return projects
+    if args.project:
+        wanted = args.project.rstrip("/")
+        wanted_abs = os.path.abspath(os.path.expanduser(wanted))
+        matches = [p for p in projects if p == wanted_abs or os.path.basename(p) == wanted]
+        if not matches and os.path.isdir(wanted_abs):
+            matches = [wanted_abs]
+        if not matches:
+            raise SystemExit(f"coord-dirty: project not found: {args.project}")
+        if len(matches) > 1:
+            raise SystemExit(f"coord-dirty: ambiguous project: {args.project}")
+        return matches
+    root = current_project_root()
+    if not root:
+        raise SystemExit("coord-dirty: run from a coord project or pass --project/--all-projects")
+    return [root]
+
+
+def git_worktrees(project):
+    r = run(["git", "-C", project, "worktree", "list", "--porcelain"])
+    if r.returncode != 0:
+        return [{"path": project, "branch": "", "error": r.stderr.strip()}]
+    worktrees = []
+    cur = {}
+    for line in r.stdout.splitlines():
+        if line.startswith("worktree "):
+            if cur:
+                worktrees.append(cur)
+            cur = {"path": line[len("worktree "):], "branch": ""}
+        elif line.startswith("branch "):
+            cur["branch"] = line[len("branch refs/heads/"):] if line.startswith("branch refs/heads/") else line[len("branch "):]
+        elif line == "detached":
+            cur["branch"] = "(detached)"
+    if cur:
+        worktrees.append(cur)
+    return worktrees
+
+
+def status_for(path):
+    r = run(["git", "-C", path, "status", "--short", "--branch", "--untracked-files=all"])
+    if r.returncode != 0:
+        return {"dirty": False, "error": r.stderr.strip(), "lines": [], "staged": 0, "unstaged": 0, "untracked": 0}
+    lines = r.stdout.splitlines()
+    file_lines = [line for line in lines if not line.startswith("##")]
+    staged = 0
+    unstaged = 0
+    untracked = 0
+    for line in file_lines:
+        if line.startswith("??"):
+            untracked += 1
+            continue
+        if len(line) > 0 and line[0] not in (" ", "?"):
+            staged += 1
+        if len(line) > 1 and line[1] not in (" ", "?"):
+            unstaged += 1
+    return {
+        "dirty": bool(file_lines),
+        "lines": lines,
+        "staged": staged,
+        "unstaged": unstaged,
+        "untracked": untracked,
+    }
+
+
+def parse_frontmatter(path):
+    try:
+        raw = open(path, encoding="utf-8").read(6000)
+    except OSError:
+        return {}
+    if not raw.startswith("---\n"):
+        return {}
+    end = raw.find("\n---\n", 4)
+    if end < 0:
+        return {}
+    fm = {}
+    current = None
+    for line in raw[4:end].splitlines():
+        m = re.match(r"^([A-Za-z_][\w_-]*):\s*(.*)$", line)
+        if m:
+            current = m.group(1)
+            value = m.group(2).strip().strip('"').strip("'")
+            fm[current] = value
+        elif current and re.match(r"^\s+-\s+", line):
+            fm.setdefault(current, [])
+            if not isinstance(fm[current], list):
+                fm[current] = []
+            fm[current].append(re.sub(r"^\s+-\s+", "", line).strip())
+    return fm
+
+
+def active_tasks(project):
+    task_dirs = ["tasks", "tasks/coord"]
+    rows = []
+    seen = set()
+    for task_dir in task_dirs:
+        base = os.path.join(project, task_dir)
+        for path in sorted(glob.glob(os.path.join(base, "*.md"))):
+            if path in seen:
+                continue
+            seen.add(path)
+            fm = parse_frontmatter(path)
+            status = fm.get("status", "")
+            if status not in INTERESTING_STATUSES:
+                continue
+            rows.append({
+                "id": fm.get("id") or os.path.splitext(os.path.basename(path))[0],
+                "status": status,
+                "assigned": fm.get("assigned", ""),
+                "round": fm.get("round", ""),
+                "updated": fm.get("updated", ""),
+                "task": fm.get("task", ""),
+            })
+    rows.sort(key=lambda row: (row.get("updated") or "", row.get("id") or ""), reverse=True)
+    return rows
+
+
+def pid_alive(pid_text):
+    try:
+        pid = int(str(pid_text).strip())
+    except ValueError:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def runtime(project):
+    label = safe_label(project)
+    lock_path = os.path.join(project, ".coord", "worker.lock")
+    log_path = os.path.join(project, ".coord", "worker.log")
+    lock_pid = ""
+    lock_active = False
+    if os.path.exists(lock_path):
+        try:
+            lock_pid = open(lock_path, encoding="utf-8").read().strip()
+        except OSError:
+            lock_pid = ""
+        lock_active = pid_alive(lock_pid)
+
+    latest = []
+    if os.path.exists(log_path):
+        try:
+            lines = open(log_path, encoding="utf-8", errors="replace").read().splitlines()[-200:]
+        except OSError:
+            lines = []
+        patterns = (
+            "tick: running",
+            "warning: worktree dirty before",
+            "tentative commit skipped",
+            "git commit skipped",
+            "tick failed",
+            "needs human review",
+        )
+        latest = [line for line in lines if any(p in line for p in patterns)][-8:]
+
+    return {
+        "label": label,
+        "worker_lock": lock_path if os.path.exists(lock_path) else "",
+        "worker_lock_pid": lock_pid,
+        "worker_lock_active": lock_active,
+        "worker_log": log_path if os.path.exists(log_path) else "",
+        "worker_log_hints": latest,
+    }
+
+
+def infer_owner(worktree, status, tasks, rt):
+    if not status.get("dirty"):
+        return "clean"
+    if rt.get("worker_lock_active"):
+        return f"coord worker active pid {rt.get('worker_lock_pid')}"
+    for task in tasks:
+        if task.get("status") == "codex-working":
+            return f"codex on {task['id']}"
+        if task.get("status") == "claude-working":
+            return f"claude on {task['id']}"
+    for hint in reversed(rt.get("worker_log_hints") or []):
+        m = re.search(r"running (\S+) with (claude|codex)", hint)
+        if m:
+            return f"latest worker run: {m.group(2)} on {m.group(1)}"
+        m = re.search(r"dirty before (claude|codex) runs (\S+)", hint)
+        if m:
+            return f"pre-existing before {m.group(1)} on {m.group(2)}"
+    branch = worktree.get("branch") or ""
+    path = worktree.get("path") or ""
+    if branch and branch not in ("main", "master", "(detached)"):
+        return f"manual/task branch {branch}"
+    if re.search(r"-task-[A-Za-z0-9_-]+$", path):
+        return f"manual task worktree {os.path.basename(path)}"
+    return "unknown/manual"
+
+
+def inspect_project(project):
+    tasks = active_tasks(project)
+    rt = runtime(project)
+    worktrees = []
+    for wt in git_worktrees(project):
+        st = status_for(wt["path"]) if not wt.get("error") else {"dirty": False, "error": wt["error"], "lines": []}
+        wt = dict(wt)
+        wt["status"] = st
+        wt["likely_owner"] = infer_owner(wt, st, tasks, rt)
+        worktrees.append(wt)
+    return {
+        "project": project,
+        "label": safe_label(project),
+        "runtime": rt,
+        "active_tasks": tasks,
+        "worktrees": worktrees,
+    }
+
+
+def render_text(reports):
+    any_dirty = False
+    for report in reports:
+        print(f"# {report['label']}  {report['project']}")
+        dirty_count = sum(1 for wt in report["worktrees"] if wt["status"].get("dirty"))
+        any_dirty = any_dirty or dirty_count > 0
+        print(f"worktrees: {len(report['worktrees'])}  dirty: {dirty_count}")
+        rt = report["runtime"]
+        if rt.get("worker_lock"):
+            state = "active" if rt.get("worker_lock_active") else "stale"
+            print(f"worker lock: {state} pid={rt.get('worker_lock_pid') or '?'}")
+        if report["active_tasks"]:
+            print("active tasks:")
+            for task in report["active_tasks"][:6]:
+                print(f"  - {task['id']} [{task['status']} -> {task.get('assigned') or '?'}] r{task.get('round') or '?'}")
+        print("worktree status:")
+        for wt in report["worktrees"]:
+            st = wt["status"]
+            marker = "DIRTY" if st.get("dirty") else "clean"
+            counts = f"staged={st.get('staged', 0)} unstaged={st.get('unstaged', 0)} untracked={st.get('untracked', 0)}"
+            print(f"  - {marker:<5} {wt.get('branch') or '?':<24} {wt['path']}")
+            print(f"        owner: {wt['likely_owner']}  {counts}")
+            if st.get("error"):
+                print(f"        error: {st['error']}")
+            for line in st.get("lines", []):
+                if not line.startswith("##"):
+                    print(f"        {line}")
+        if rt.get("worker_log_hints"):
+            print("worker hints:")
+            for line in rt["worker_log_hints"]:
+                print(f"  {line}")
+        print()
+    if not reports:
+        print("No projects inspected.")
+    elif not any_dirty:
+        print("No dirty coord worktrees found.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Report dirty coord worktrees.")
+    parser.add_argument("--project", help="registered project basename or absolute path")
+    parser.add_argument("--all-projects", action="store_true", help="inspect every project in coord-wright/projects.txt")
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    args = parser.parse_args()
+
+    projects = select_projects(args)
+    reports = [inspect_project(project) for project in projects if os.path.isdir(project)]
+    if args.json:
+        print(json.dumps({"generated_at": int(time.time()), "reports": reports}, indent=2))
+    else:
+        render_text(reports)
+
+
+if __name__ == "__main__":
+    main()
