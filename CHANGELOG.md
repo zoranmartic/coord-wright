@@ -2,6 +2,20 @@
 
 Notable changes to CoordWright. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are annotated tags on `main`.
 
+## [0.3.1] — 2026-09-30
+
+### Fixed
+
+- Agent code commits in a repo without a git remote: `bin/coord-commit-agent.sh` keeps the commit, logs that the push was skipped and exits 0, as `coord` already did for queue commits. Before, the failed push stopped the round before its final status update.
+- `/coord-run` names the full `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord"` form (the CLI is not on PATH) and the `coord-check` skill by its path.
+- The `_No findings yet._` placeholder is dropped when the first finding is appended, instead of staying above `### Round 1`.
+
+### Added
+
+- `coord new --scope-budget-loc=<band>` sets `scope_budget` at creation, so a shaped task passes `coord-review` without an extra update.
+- README "Try it (one agent, no background workers)": one Claude-only task, shape to done, with no launchd, no Codex and no git remote.
+- `docs/worked-example.md`: a captured two-agent run (Codex coder, Claude reviewer) from shape to done.
+
 ## [0.3.0] — 2026-09-30
 
 ### Added
@@ -81,5 +95,6 @@ Notable changes to CoordWright. The format follows [Keep a Changelog](https://ke
 
 - Initial public release: file-backed task queue with a typed contract, launchd workers, cross-model (Claude ⇄ Codex) review loop, `coord` CLI, skills, hooks, agents, and docs.
 
+[0.3.1]: https://github.com/zoranmartic/coord-wright/releases/tag/v0.3.1
 [0.3.0]: https://github.com/zoranmartic/coord-wright/releases/tag/v0.3.0
 [0.2.0]: https://github.com/zoranmartic/coord-wright/releases/tag/v0.2.0

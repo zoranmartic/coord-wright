@@ -838,10 +838,12 @@ def set_section(body, name, new_content):
 def append_round(section_content, round_n, text):
     """Append ### Round N block to a findings section."""
     existing = (section_content or "").rstrip()
+    if existing.strip() == "_No findings yet._":
+        existing = ""
     header = f"### Round {round_n}"
     text = re.sub(r"(?m)^## ", "### ", text.strip())
     block = f"\n\n{header}\n\n{text}\n"
-    return (existing + block) if existing.strip() else block
+    return (existing + block) if existing.strip() else block[1:]
 
 
 def section_has_round(section_content, round_n):
@@ -2707,6 +2709,9 @@ def cmd_new(args):
     if roles:
         fm["roles"] = roles
 
+    if getattr(args, "scope_budget_loc", None):
+        fm["scope_budget"] = {"net_loc_delta_target": str(args.scope_budget_loc).strip(),
+                              "abort_if_exceeded_by_pct": 50}
     if args.review_rounds_max is not None:
         fm["review_rounds_max"] = args.review_rounds_max
 
@@ -3152,6 +3157,8 @@ def build_parser():
     # new
     s = sub.add_parser("new")
     s.add_argument("--task", required=True)
+    s.add_argument("--scope-budget-loc", "--scope_budget_loc", dest="scope_budget_loc",
+                   help="net LOC delta target band, e.g. '+20 to +80' (sets scope_budget)")
     s.add_argument("--status")
     s.add_argument("--assigned")
     s.add_argument("--agents")

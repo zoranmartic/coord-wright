@@ -4,7 +4,11 @@ description: Run a pre-resolved coord task in the foreground. Usage: /coord-run 
 
 You are running the already-resolved coord task `$ARGUMENTS`.
 
-Delegate to `skills/coord-check/SKILL.md` as the authoritative protocol for
+`coord` below is shorthand for `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord"`;
+it is not on PATH.
+
+Delegate to the `coord-check` skill
+(`${COORD_TOOLS:-$HOME/Projects/coord-wright}/skills/coord-check/SKILL.md`) as the authoritative protocol for
 task reads, token accounting, findings, status transitions, round-role handling,
 and finish-or-handoff updates.
 

@@ -56,6 +56,10 @@ current_upstream() {
 
 push_current_branch() {
   local upstream
+  if [[ -z "$(git remote)" ]]; then
+    coord_commit_log "no git remote; commit kept local, push skipped"
+    return 0
+  fi
   upstream=$(current_upstream)
   if [[ -n "$upstream" ]]; then
     coord_commit_run_logged git fetch --quiet "${upstream%%/*}"

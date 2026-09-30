@@ -214,6 +214,18 @@ class CoordCommitAgentTests(unittest.TestCase):
             log_path.read_text(encoding="utf-8"),
         )
 
+    def test_commit_without_a_remote_succeeds_and_skips_push(self):
+        repo = self.init_repo()
+        self.git(repo, "remote", "remove", "origin")
+        base_status = self.write_base_status()
+        (repo / "change.txt").write_text("local only\n", encoding="utf-8")
+
+        result = self.run_helper(repo, base_status)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        committed = self.git(repo, "show", "--name-only", "--pretty=", "HEAD").stdout.split()
+        self.assertIn("change.txt", committed)
+
     def test_scoped_commit_keeps_scope_when_coord_paths_fails(self):
         repo = self.init_repo()
         base_status = self.write_base_status()

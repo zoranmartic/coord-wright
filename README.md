@@ -76,6 +76,43 @@ CoordWright orchestrates those two CLIs; it does not bundle or replace them, and
 
 With the acknowledgement, worker-launched Claude runs with `--dangerously-skip-permissions` and Codex runs with `--sandbox danger-full-access` — full, promptless power inside the registered repos. That is what you are switching on; leave it off for interactive-only use (shaping, status, review from your own Claude/Codex sessions), which works without it.
 
+## Try it (one agent, no background workers)
+
+One task, shape to done, with Claude Code only: no `projects.txt`, no launchd worker, no Codex, no `COORD_UNSAFE_AUTONOMOUS`, no git remote. Needs the Claude Code CLI (logged in), Python 3.9+, `jq`, `git`; tested on macOS.
+
+```sh
+git clone https://github.com/zoranmartic/coord-wright ~/Projects/coord-wright
+cd ~/Projects/coord-wright && ./install.sh     # ends with "no projects.txt; skipping launchd setup"
+coord() { python3 "$HOME/Projects/coord-wright/bin/coord" "$@"; }   # the CLI is not on PATH
+
+mkdir ~/cw-demo && cd ~/cw-demo && git init -q -b main
+printf 'def greet(name):\n    return "Hello " + name\n' > greet.py
+printf 'import unittest\nfrom greet import greet\n\n\nclass GreetTest(unittest.TestCase):\n    def test_default(self):\n        self.assertEqual(greet("Ann"), "Hello Ann")\n' > test_greet.py
+printf '.coord/*\n!.coord/handoffs/\n__pycache__/\n' > .gitignore
+git add -A && git commit -qm initial
+
+echo 'Add an optional shout=False argument to greet() in greet.py; when true return the greeting upper-cased. Add a shout test to test_greet.py. No other files.' > /tmp/demo-plan.md
+printf '%s\n' '- [ ] **S1: Add a shout option to greet and a test**' '  complexity: simple' '  model_claude: sonnet' \
+  '  model_codex: gpt-5.6-sol' '  Add shout=False to greet(); add a test for shout=True in test_greet.py.' \
+  '  Writes handoff: `.coord/handoffs/<task-id>/S1.md`' > /tmp/demo-subtasks.md
+ID=$(coord new --task "Add a shout option to greet" --assigned claude --complexity simple --kind code-fix \
+  --reasoning_effort medium --scope "greet.py,test_greet.py" --scope-budget-loc "+3 to +15" \
+  --set-plan @/tmp/demo-plan.md --set-subtasks @/tmp/demo-subtasks.md \
+  --acceptance "greet(name) output is unchanged; with shout=True the greeting is upper-cased" \
+  --verify_commands "python3 -m unittest -v test_greet")
+coord promote "$ID" && echo "$ID"
+```
+
+`install.sh` symlinks the skills and commands into `~/.claude` and `~/.agents` and merges permission rules and hooks into `~/.claude/settings.json`. The plan and subtask files live outside the repo because an untracked file there would block the agent's commit. `promote` needs `complexity`, `kind`, `reasoning_effort`, a Plan, a subtask with `complexity`, `model_claude`, `model_codex` and a `Writes handoff:` line, and `acceptance` or `verify_commands`. A Claude-only task still carries a `model_codex` line; the CLI requires it. `--acceptance` splits on commas, so keep them out.
+
+Now, in `~/cw-demo`, start `claude` and type `/coord-run <id>`. Two commands need your approval: the verify command `python3 -m unittest -v test_greet`, and the commit step `COORD_TASK_ID=<id> COORD_AGENT=claude COORD_BASE_GIT_STATUS_FILE=... bash ~/Projects/coord-wright/bin/coord-commit-agent.sh`. Claude may also ask to run commands containing `${...}` expansions or `printenv`; approving is fine, and if you decline it retries with plain paths.
+
+**What you should see:** `coord list` prints `(no tasks)` (the task file moved to `tasks/archive/`); `coord show "$ID" --result` reports `status: done`, the finding, the S1 handoff and a token total; `git log --oneline` shows `coord: new`, `promote`, `status=claude-working`, `coord: work <id>` (code and handoff) and `complete-subtask=S1 status=done`. `git push skipped: no configured push destination` lines are expected.
+
+**Undo:** run `~/Projects/coord-wright/uninstall.sh` (removes the symlinks, leaves `settings.json` untouched), then restore `~/.claude/settings.json.bak.<YYYYmmddHHMMSS>`, the copy `install.sh` saved before merging (if you had no `settings.json`, delete the merged one), and remove `~/cw-demo`.
+
+For a captured two-agent run (Codex codes, Claude reviews), see [docs/worked-example.md](docs/worked-example.md). For the full setup with background workers, see [Install](#install) and [Quickstart](#quickstart).
+
 ## Install
 
 ```sh
@@ -113,7 +150,7 @@ COORD_UNSAFE_AUTONOMOUS=1 ./install.sh
 
 The `/coord-*` skills (`coord-shape`, `coord-check`, `coord-status`, `coord-promote`, and friends) are the interface; the `coord` CLI underneath does the bookkeeping. Per-project worker config goes in `<project>/.coord/config.env` — see [`templates/config.example.env`](templates/config.example.env). Without the `COORD_UNSAFE_AUTONOMOUS=1` acknowledgement everything except unattended worker rounds still works — shape, promote, and review from your own sessions, or run a task in the foreground with `/coord-run`.
 
-A git remote is optional; without one coord commits locally and skips the push. A push that *fails* (still rejected after one `pull --rebase --autostash` retry, no credentials) is a loud non-zero error (exit 4) — coord never reports a queue write as done when it didn't land. The worker is silent while idle (`.coord/worker.log` records one line saying rounds are disabled if the acknowledgement is missing); `launchctl list | grep com.coord.worker` confirms it is loaded. `bin/coord-log <project>` follows a compact one-line-per-round view of that log (`--once` prints recent history and exits).
+A git remote is optional; without one, both the `coord` queue commits and the agent's code commits (`bin/coord-commit-agent.sh`) stay local and the push is skipped. A push that *fails* (still rejected after one `pull --rebase --autostash` retry, no credentials) is a loud non-zero error (exit 4) — coord never reports a queue write as done when it didn't land. The worker is silent while idle (`.coord/worker.log` records one line saying rounds are disabled if the acknowledgement is missing); `launchctl list | grep com.coord.worker` confirms it is loaded. `bin/coord-log <project>` follows a compact one-line-per-round view of that log (`--once` prints recent history and exits).
 
 ## What this is — and isn't
 
@@ -135,7 +172,7 @@ docs/       the coordination protocol + the workflow-discipline policy
 tests/      the test suite (run: python3 -m pytest tests/)
 ```
 
-Reading order, if you want to understand it rather than run it: [`docs/architecture.md`](docs/architecture.md) (how the parts fit) → [`docs/task-files.md`](docs/task-files.md) (the task contract) → [`docs/coordination.md`](docs/coordination.md) (the shared protocol) → [`docs/agent-workflow-policy.md`](docs/agent-workflow-policy.md) (the discipline).
+Reading order, if you want to understand it rather than run it: [`docs/architecture.md`](docs/architecture.md) (how the parts fit) → [`docs/task-files.md`](docs/task-files.md) (the task contract) → [`docs/coordination.md`](docs/coordination.md) (the shared protocol) → [`docs/agent-workflow-policy.md`](docs/agent-workflow-policy.md) (the discipline). To see one task go through all of it, read [`docs/worked-example.md`](docs/worked-example.md).
 
 ## License
 
