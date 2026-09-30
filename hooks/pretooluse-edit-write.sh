@@ -68,7 +68,7 @@ esac
 
 # Coord worker runtime files — owned by the launchd worker, not Claude.
 case "$path" in
-  */.coord/worker.lock|*/.coord/worker.state|*/.coord/sleep-until|*/.coord/config.env)
+  */.coord/worker.lock|*/.coord/worker.state|*/.coord/sleep-until|*/.coord/sleep-until.*|*/.coord/config.env)
     block "coord safety hook: '$path' is owned by the coord launchd worker; editing it from Claude can break the worker. Manual shell edits only."
     ;;
 esac

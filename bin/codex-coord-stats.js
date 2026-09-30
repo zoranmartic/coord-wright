@@ -3,8 +3,14 @@
 import fs from "fs";
 
 const args = process.argv.slice(2);
+const roundMode = args[0] === "--round-summary";
 const jsonMode = args[0] === "--json";
-const filePath = jsonMode ? args[1] : args[0];
+const expectedCwd = roundMode && args[1] === "--expect-cwd" ? args[2] : null;
+if (roundMode && (!expectedCwd || args.length !== 4)) {
+  process.stderr.write("Usage: codex-coord-stats.js --round-summary --expect-cwd <cwd> <rollout-file>\n");
+  process.exit(1);
+}
+const filePath = roundMode ? args[3] : jsonMode ? args[1] : args[0];
 if (!filePath) {
   process.exit(1);
 }
@@ -13,6 +19,51 @@ let content = "";
 try {
   content = fs.readFileSync(filePath, "utf8");
 } catch {
+  process.exit(roundMode ? 1 : 0);
+}
+
+if (roundMode) {
+  const events = content.split(/\r?\n/).filter((line) => line.trim()).map((line) => {
+    try {
+      return JSON.parse(line);
+    } catch {
+      process.stderr.write("Invalid JSON in rollout; summary is incomplete.\n");
+      process.exit(1);
+    }
+  });
+  const meta = events.find((event) => event.type === "session_meta")?.payload;
+  const contexts = events.filter((event) => event.type === "turn_context");
+  if (meta?.cwd !== expectedCwd || contexts.some((event) => event.payload?.cwd !== expectedCwd)) {
+    process.stderr.write("Rollout cwd does not match --expect-cwd.\n");
+    process.exit(1);
+  }
+  const context = contexts.at(-1)?.payload;
+  const snapshots = events.filter((event) => event.type === "event_msg" &&
+    event.payload?.type === "token_count" && event.payload.info?.total_token_usage);
+  const usage = snapshots.at(-1)?.payload.info.total_token_usage;
+  const input = firstNumber(usage?.input_tokens);
+  const cached = firstNumber(usage?.cached_input_tokens);
+  const output = firstNumber(usage?.output_tokens);
+  const reasoning = firstNumber(usage?.reasoning_output_tokens);
+  const timestamps = events.map((event) => event.timestamp).filter(Boolean);
+  const calls = events.filter((event) => event.type === "response_item" &&
+    ["function_call", "custom_tool_call"].includes(event.payload?.type));
+  process.stdout.write(JSON.stringify({
+    session_id: meta.id ?? null,
+    cwd: meta.cwd,
+    model: context?.model ?? null,
+    reasoning_effort: context?.effort ?? null,
+    cli_version: meta.cli_version ?? null,
+    first_timestamp: timestamps[0] ?? null,
+    last_timestamp: timestamps.at(-1) ?? null,
+    input_tokens: input,
+    cached_input_tokens: cached,
+    uncached_input_tokens: input != null && cached != null ? input - cached : null,
+    output_tokens: output,
+    reasoning_output_tokens: reasoning,
+    non_reasoning_output_tokens: output != null && reasoning != null ? output - reasoning : null,
+    tool_calls: calls.length,
+  }));
   process.exit(0);
 }
 

@@ -9,7 +9,7 @@ Project-root preflight:
 
 - Resolve the canonical project checkout before showing command-specific coord help:
   `COORD_MAIN=$("${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord-project-root") && cd "$COORD_MAIN"`
-- Generic skill-file help can be shown without changing directories, but any `coord help <subcommand>` call should run from the main checkout.
+- Generic skill-file help can be shown without changing directories, but any `coord <subcommand> --help` call should run from the main checkout.
 
 ## Syntax
 
@@ -36,7 +36,7 @@ Project-root preflight:
    - If the skill maps to a `coord` subcommand, append a section:
      ```
      ─── coord help ───
-     <output of: python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" help <subcommand>>
+     <output of: python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" <subcommand> --help>
      ```
    - Skill → `coord` subcommand mapping (use this when present, omit the section when the skill has no direct mapping):
      - `coord-promote` → `promote`

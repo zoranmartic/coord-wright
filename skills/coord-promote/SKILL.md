@@ -25,7 +25,7 @@ Project-root preflight:
    - For each id in the list, run:
      `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" promote <id>`
    - `coord promote` auto-commits-and-pushes each task individually. Do not run manual `git add`, `git commit`, or `git push`.
-   - If any invocation exits non-zero: print the failing id and its stderr, then **stop immediately**. Do not retry. Do not use `--shape-override` or any bypass.
+   - If any invocation exits non-zero: print the failing id and its stderr, then **stop immediately**. Do not retry or look for a bypass.
 
 4. **Report.**
    - One line per promoted id: `promoted: <id>`.
@@ -33,7 +33,6 @@ Project-root preflight:
 
 ## Rules
 
-- Never use `--no-verify`, `--force`, or `--shape-override`.
-- Stage only the exact files for the promoted ids.
+- Never use `--no-verify` or `--force`.
 - If `coord promote` rejects an id (shaping warning, missing plan, etc.), surface the error as-is — the task is not ready.
 - Keep output terse; no extra commentary beyond the per-id lines and the commit/push result.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# merge-to-main.sh — fast-forward a task worktree branch into canonical main
+# merge-to-main.sh — fast-forward a session worktree branch into canonical main
 #
 # Exit codes:
 #   0  success — merge and push complete
@@ -29,9 +29,9 @@ MAIN_ROOT=$(cd "$MAIN_ROOT" && pwd -P)
 TASK_BRANCH=$(git -C "$TASK_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null) \
   || die "current worktree is detached; run this from a task branch"
 
-# ── 2. Guard: registered task worktree, not main ─────────────────────────────
+# ── 2. Guard: registered session worktree, not main ─────────────────────────────
 [[ "$TASK_ROOT" != "$MAIN_ROOT" && "$TASK_BRANCH" != "main" ]] \
-  || die "run this from a task worktree, not the main checkout"
+  || die "run this from a session worktree, not the main checkout"
 
 grep -qFx -- "$MAIN_ROOT" "$COORD_TOOLS/projects.txt" 2>/dev/null \
   || die "main checkout is not registered in $COORD_TOOLS/projects.txt: $MAIN_ROOT"
@@ -43,7 +43,7 @@ esac
 
 # ── 3. Dirty check ────────────────────────────────────────────────────────────
 [[ -z "$(git -C "$TASK_ROOT" status --porcelain)" ]] \
-  || die "task worktree is dirty; commit or clean it before merging"
+  || die "session worktree is dirty; commit or clean it before merging"
 [[ -z "$(git -C "$MAIN_ROOT" status --porcelain)" ]] \
   || die "main checkout is dirty; commit or clean it before merging"
 
@@ -132,5 +132,5 @@ git -C "$MAIN_ROOT" push origin main \
   || die "push failed; investigate and push manually from $MAIN_ROOT"
 
 MAIN_COMMIT=$(git -C "$MAIN_ROOT" rev-parse --short HEAD)
-printf 'merged %s into main at %s; task worktree remains on %s\n' \
+printf 'merged %s into main at %s; session worktree remains on %s\n' \
   "$TASK_UPSTREAM" "$MAIN_COMMIT" "$TASK_BRANCH"

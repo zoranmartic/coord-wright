@@ -3,26 +3,43 @@
 # match is anchored to the structured terminal-error locus, NOT the whole
 # artifact, so a failed run whose ordinary output merely mentions limit
 # vocabulary (e.g. a task that edits this very file) is not misclassified as a
-# provider limit. If a limit is found, write .coord/sleep-until with a unix
-# timestamp and exit 0. Otherwise exit 1.
+# provider limit. If a limit is found, write .coord/sleep-until.<agent> with a
+# unix timestamp and exit 0. Otherwise exit 1.
 #
 # Usage: rate-limit.sh check <agent> <agent-output-file>
+#        rate-limit.sh reset <agent>
 #
-# Relative paths in this script (e.g. .coord/sleep-until) are resolved
+# Relative paths in this script (e.g. .coord/sleep-until.claude) are resolved
 # against the worker's current working directory, which is the project root.
 
 set -euo pipefail
 
+# Reset clock times ("resets 3pm") are read in COORD_TZ when set, else local time.
+if [[ -n "${COORD_TZ:-}" ]]; then
+  export TZ="$COORD_TZ"
+fi
+
 ACTION="${1:?usage: rate-limit.sh check <agent> <agent-output-file>}"
 AGENT="${2:?usage: rate-limit.sh check <agent> <agent-output-file>}"
-OUTPUT="${3:?usage: rate-limit.sh check <agent> <agent-output-file>}"
+OUTPUT="${3:-}"
 
-if [[ "$ACTION" != "check" ]]; then
+if [[ "$ACTION" != "check" && "$ACTION" != "reset" ]]; then
   echo "unknown action: $ACTION" >&2
   exit 2
 fi
+if [[ "$AGENT" != "claude" && "$AGENT" != "codex" ]]; then
+  echo "unknown agent: $AGENT" >&2
+  exit 2
+fi
 
-BUILTIN_REGEX='rate.?limit|usage limit|session limit|quota.*exhaust|too many requests'
+BACKOFF_FILE=".coord/capacity-backoff.$AGENT"
+if [[ "$ACTION" == "reset" ]]; then
+  rm -f "$BACKOFF_FILE"
+  exit 0
+fi
+: "${OUTPUT:?usage: rate-limit.sh check <agent> <agent-output-file>}"
+
+BUILTIN_REGEX='rate.?limit|usage limit|session limit|hit your (usage |session |weekly )?limit|(usage|session|weekly|[0-9]+-hour) limit reached|quota.*exhaust|too many requests|at capacity|overloaded'
 AGENT_REGEX=""
 case "$AGENT" in
   claude) AGENT_REGEX="${CLAUDE_COORD_TRANSIENT_PROVIDER_LIMIT_REGEX:-}" ;;
@@ -101,7 +118,7 @@ if ! printf '%s\n' "$ERROR_TEXT" | grep -qiE "$REGEX"; then
   exit 1
 fi
 
-NOW=$(date +%s)
+NOW=${RATE_LIMIT_NOW:-$(date +%s)}
 TARGET=$(RATE_LIMIT_TEXT="$ERROR_TEXT" python3 - "$NOW" <<'PYEOF'
 import datetime
 import os
@@ -111,8 +128,8 @@ import sys
 now = int(sys.argv[1])
 text = os.environ.get("RATE_LIMIT_TEXT", "")
 patterns = [
-    r"\breset(?:s)?[^0-9]*(\d{1,2}:\d{2})\s*([ap]\.?m\.?)?",
-    r"\btry again at[^0-9]*(\d{1,2}:\d{2})\s*([ap]\.?m\.?)?",
+    r"\bresets?\s+(?:at\s+)?(\d{1,2}(?::\d{2})?)\s*([ap]\.?m\.?)?",
+    r"\btry again at\s+(\d{1,2}(?::\d{2})?)\s*([ap]\.?m\.?)?",
 ]
 
 for pattern in patterns:
@@ -123,7 +140,10 @@ for pattern in patterns:
     meridiem = (match.group(2) or "").replace(".", "").upper()
     try:
         if meridiem:
-            parsed = datetime.datetime.strptime(clock + meridiem, "%I:%M%p").time()
+            fmt = "%I:%M%p" if ":" in clock else "%I%p"
+            parsed = datetime.datetime.strptime(clock + meridiem, fmt).time()
+        elif ":" not in clock:
+            continue
         else:
             parsed = datetime.datetime.strptime(clock, "%H:%M").time()
     except ValueError:
@@ -133,15 +153,34 @@ for pattern in patterns:
     target = base.replace(hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0)
     ts = int(target.timestamp())
     if ts <= now:
-        ts += 86400
+        # A reset time in the last few minutes means the worker fired at the
+        # reset minute and the provider still reported it: retry shortly
+        # instead of rolling the marker a full day forward.
+        ts = now + 300 if now - ts < 300 else ts + 86400
     print(ts)
     break
 PYEOF
 )
-if [[ -z "$TARGET" ]]; then
-  TARGET=$((NOW + 3600))   # default: 1h
-fi
-
 mkdir -p .coord
-echo "$TARGET" > .coord/sleep-until
+if [[ -n "$TARGET" ]]; then
+  rm -f "$BACKOFF_FILE"
+elif printf '%s\n' "$ERROR_TEXT" | grep -qiE 'at capacity|overloaded' &&
+     ! printf '%s\n' "$ERROR_TEXT" | grep -qiE 'usage limit|session limit|quota.*exhaust'; then
+  DELAY=60
+  if [[ -f "$BACKOFF_FILE" ]]; then
+    PREVIOUS=$(cat "$BACKOFF_FILE")
+    case "$PREVIOUS" in
+      60) DELAY=300 ;;
+      120|240|300) DELAY=600 ;;
+      600) DELAY=1200 ;;
+      1200|1800) DELAY=1800 ;;
+    esac
+  fi
+  echo "$DELAY" > "$BACKOFF_FILE"
+  TARGET=$((NOW + DELAY))
+else
+  rm -f "$BACKOFF_FILE"
+  TARGET=$((NOW + 3600))   # quota fallback: 1h
+fi
+echo "$TARGET" > ".coord/sleep-until.$AGENT"
 exit 0

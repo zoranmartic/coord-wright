@@ -13,7 +13,10 @@ cd "$PROJ"
 mkdir -p .coord
 
 LOG=.coord/watchdog.log
-ts() { TZ=Europe/Dublin date +%FT%T%z; }
+if [[ -n "${COORD_TZ:-}" ]]; then
+  export TZ="$COORD_TZ"
+fi
+ts() { date +%FT%T%z; }
 
 # Unattended autonomy gate — same contract as worker.sh. The watchdog mutates
 # task state and launches Claude without a human present, so it requires the
@@ -169,6 +172,56 @@ if [[ -z "$STUCK_IDS" ]]; then
   exit 0
 fi
 
+# Human-hold gate. A task carrying pickup_hold=true is parked for a human
+# decision: never re-triage it. Also auto-park a task whose last two Claude
+# findings are both watchdog verdicts with no status change in between, so a
+# "human must decide" verdict is written once instead of on every cycle, each
+# pass re-reading the task and spending tokens. Release with:
+#   coord update <id> --pickup-hold=false --status=pending --force
+TASKS_DIR=$(python3 "$TOOLS/bin/coord" paths --json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('tasks_dir','tasks'))" 2>/dev/null || echo tasks)
+TRIAGE_IDS=""
+for ID in $STUCK_IDS; do
+  TASK_FILE="$TASKS_DIR/$ID.md"
+  [[ -f "$TASK_FILE" ]] || TASK_FILE="${ARCHIVE_DIR:-tasks/archive}/$ID.md"
+  GATE=$(python3 - "$TASK_FILE" <<'PYEOF'
+import re, sys
+try:
+    text = open(sys.argv[1], encoding="utf-8").read()
+except OSError:
+    print("triage"); raise SystemExit
+m = re.match(r"(?s)^---\n(.*?)\n---\n(.*)$", text)
+fm, body = (m.group(1), m.group(2)) if m else ("", text)
+if re.search(r"^pickup_hold:\s*(true|yes|1)\s*$", fm, re.M | re.I):
+    print("held"); raise SystemExit
+sec = re.search(r"(?ms)^## Claude findings\s*\n(.*?)(?=^## |\Z)", body)
+rounds = re.findall(r"(?ms)^### Round\s+\d+\s*\n(.*?)(?=^### Round\s+\d+\s*$|\Z)", sec.group(1)) if sec else []
+recent = [r.strip() for r in rounds[-2:]]
+if len(recent) == 2 and all(r.lower().startswith("watchdog") for r in recent):
+    print("auto-hold"); raise SystemExit
+print("triage")
+PYEOF
+)
+  case "$GATE" in
+    held)
+      echo "[$(ts)] watchdog: skipping $ID (pickup_hold=true; waiting for a human decision)" >> "$LOG"
+      ;;
+    auto-hold)
+      echo "[$(ts)] watchdog: $ID has two consecutive watchdog verdicts with no state change; setting pickup_hold and skipping until a human releases it" >> "$LOG"
+      python3 "$TOOLS/bin/coord" update "$ID" --pickup-hold --force \
+        --add-issues "watchdog auto-hold: two consecutive watchdog passes reached the same human-required verdict; release with coord update $ID --pickup-hold=false --status=pending --force" >> "$LOG" 2>&1 || true
+      ;;
+    *)
+      TRIAGE_IDS="${TRIAGE_IDS}${TRIAGE_IDS:+$'\n'}$ID"
+      ;;
+  esac
+done
+STUCK_IDS="$TRIAGE_IDS"
+
+if [[ -z "$STUCK_IDS" ]]; then
+  echo "[$(ts)] watchdog: no triageable tasks (all held)" >> "$LOG"
+  exit 0
+fi
+
 COUNT=$(echo "$STUCK_IDS" | wc -l | tr -d ' ')
 echo "[$(ts)] watchdog: $COUNT task(s) to unblock: $(echo "$STUCK_IDS" | tr '\n' ' ')" >> "$LOG"
 
@@ -231,13 +284,13 @@ FIXABLE (compilation error, import missing, wrong path, assertion failure, schem
   - git add -A && git commit -m 'watchdog: fix $ID' && git push
 
 WRONG APPROACH / SCOPE MISMATCH (the task is asking for something that conflicts with existing code, the subtask decomposition is wrong, or the acceptance criteria are ambiguous):
-  - python3 $TOOLS/bin/coord update $ID --status needs-brainstorming --append-claude-finding 'Watchdog triage: approach needs redesign. Issue: <specific problem>. Suggested fix: <what needs to change in the task or plan>.'
-  - Leave in needs-brainstorming. A human will review the finding and adjust the task.
+  - python3 $TOOLS/bin/coord update $ID --status needs-brainstorming --pickup-hold --append-claude-finding 'Watchdog triage: approach needs redesign. Issue: <specific problem>. Suggested fix: <what needs to change in the task or plan>.'
+  - Leave in needs-brainstorming. --pickup-hold parks the task so no further watchdog pass re-triages it; a human reviews the finding, adjusts the task, and releases it with --pickup-hold=false.
 
 CANNOT AUTO-FIX (physical device, live broker credentials, APNs provisioning, Apple Developer account, unavailable local server, unresolvable design ambiguity):
   - Leave status as needs-brainstorming. Do NOT change the status.
-  - python3 $TOOLS/bin/coord update $ID --append-claude-finding 'Watchdog: blocked. Root cause: <reason>. Unblocked by: <specific human action or external dependency>.'
-  - The human will see this in needs-brainstorming when they next check in.
+  - python3 $TOOLS/bin/coord update $ID --pickup-hold --append-claude-finding 'Watchdog: blocked. Root cause: <reason>. Unblocked by: <specific human action or external dependency>.'
+  - --pickup-hold parks the task: the watchdog skips held tasks, so this verdict is written once, not on every cycle. The human sees it in needs-brainstorming and releases with --pickup-hold=false once the blocker is gone.
 
 Be decisive. Do not ask for clarification." \
     > "$TMPOUT" 2>> "$LOG" || RC=$?

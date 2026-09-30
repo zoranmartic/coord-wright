@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Global N-slot semaphore for cross-project coord workers.
-# Slots are files in $TOOLS/.semaphore/. Atomic acquire via noclobber.
+# Slots are files in $TOOLS/.semaphore/. Sweep and acquire share an OS file lock.
 #
 # Usage:
 #   semaphore.sh acquire    # exit 0 if slot taken, 1 if all full
@@ -20,25 +20,43 @@ mkdir -p "$DIR"
 
 case "$ACTION" in
   acquire)
-    # Sweep stale holders (process no longer alive).
-    for h in "$DIR"/holder-*; do
-      [[ -f "$h" ]] || continue
-      pid="${h##*/holder-}"
-      if ! kill -0 "$pid" 2>/dev/null; then
-        slot=$(cat "$h" 2>/dev/null || true)
-        [[ -n "$slot" ]] && rm -f "$slot"
-        rm -f "$h"
-      fi
-    done
-    # Try to grab the first free slot atomically.
-    for i in $(seq 1 "$N"); do
-      SLOT="$DIR/slot-$i"
-      if ( set -C; echo "$OWNER" > "$SLOT" ) 2>/dev/null; then
-        echo "$SLOT" > "$DIR/holder-$OWNER"
-        exit 0
-      fi
-    done
-    exit 1
+    python3 - "$DIR" "$N" "$OWNER" <<'PYEOF'
+import fcntl
+import os
+import sys
+from pathlib import Path
+
+slots = Path(sys.argv[1])
+owner = sys.argv[3]
+with (slots / ".acquire-lock").open("a") as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(1)
+    for slot in slots.glob("slot-*"):
+        try:
+            pid = slot.read_text().strip()
+        except FileNotFoundError:
+            continue
+        if not pid:
+            continue
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            slot.unlink()
+        except PermissionError:
+            pass
+    for i in range(1, int(sys.argv[2]) + 1):
+        slot = slots / f"slot-{i}"
+        try:
+            with slot.open("x") as handle:
+                handle.write(owner + "\n")
+        except FileExistsError:
+            continue
+        (slots / f"holder-{owner}").write_text(str(slot) + "\n")
+        sys.exit(0)
+    sys.exit(1)
+PYEOF
     ;;
   release)
     HOLDER="$DIR/holder-$OWNER"

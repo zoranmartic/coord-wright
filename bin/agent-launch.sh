@@ -81,14 +81,14 @@ $HOME/.local/bin/codex
     ;;
 esac
 
-# Interactive Claude launches (the VS Code task buttons run `agent-launch.sh
-# claude` with no -p/--print) default to the highest reasoning effort. Headless
-# coord callers — worker.sh and watchdog.sh — pass -p and are deliberately left
-# alone so each task honours its own reasoning_effort and stays token-frugal.
-# Override per launch with an explicit --effort flag or CLAUDE_LAUNCH_EFFORT=<level>;
-# set CLAUDE_LAUNCH_EFFORT= to disable. An unrecognised value is ignored (with a
-# warning) rather than failing the launch.
-claude_effort=${CLAUDE_LAUNCH_EFFORT-max}
+# Interactive Claude effort is owned by ~/.claude/settings.json (effortLevel and
+# modelSettings); a default here would override it from the command line.
+# CLAUDE_LAUNCH_EFFORT=<level> opts in to an explicit --effort for interactive
+# launches (the VS Code task buttons run `agent-launch.sh claude` with no
+# -p/--print). Headless coord callers — worker.sh and watchdog.sh — pass -p and
+# are left alone so each task honours its own reasoning_effort. An unrecognised
+# value is ignored (with a warning) rather than failing the launch.
+claude_effort=${CLAUDE_LAUNCH_EFFORT-}
 case "$claude_effort" in
   low|medium|high|xhigh|max|"")
     ;;

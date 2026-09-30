@@ -25,13 +25,13 @@ Document the skip in stderr (`shape-review: skipped — <reason>`) and exit 0.
 
 Resolve canonical project root: `COORD_MAIN=$("${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord-project-root") && cd "$COORD_MAIN"`.
 
-In normal mode, target task is at `tasks/<id>.md`. In hermetic mode, target task is the absolute path passed via `--task-file`; design refs must come from `--design-refs`; dependencies must come from `--depends-on-file <id>=<path>` (repeatable). Hermetic mode fails closed if any `depends_on` id in the fixture lacks a `--depends-on-file` mapping.
+In normal mode, target task is at the path printed by `coord show <id> --path` (the tasks dir is configurable). In hermetic mode, target task is the absolute path passed via `--task-file`; design refs must come from `--design-refs`; dependencies must come from `--depends-on-file <id>=<path>` (repeatable). Hermetic mode fails closed if any `depends_on` id in the fixture lacks a `--depends-on-file` mapping.
 
 ### Step 2 — Mechanical preflight (free, deterministic)
 
 Run both mechanical gates:
 ```
-python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord-review" tasks/<id>.md
+python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord-review" "$(python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" show <id> --path)"
 python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord-shape-preflight" <id>
 ```
 
@@ -47,7 +47,7 @@ Create transcript at `.coord/shape-reviews/<id>.md` with a Subject section conta
 2. **Convergence criterion**: "agree the task is implementation-ready: no remaining interface mismatches, acceptance↔subtask contradictions, non-negotiable contradictions, fast-path contradictions, or leaked credentials."
 3. **Task content**: full frontmatter + body, verbatim, in a fenced block.
 4. **Dependencies**: for each direct `depends_on` id, embed: frontmatter (full), subtask titles + complexity (titles only). For completed deps, also embed the latest `coord show --handoff <dep-id>` output capped at 4 KB.
-5. **Design refs**: prefer **inline invariants** over embedding full design docs. The lesson from the first run: embedding a 32 KB design doc with its own review-loop transcript caused Codex to exhaust its context window reading prior-round metadata that was irrelevant to the current shape check. Instead, distill the design into a bullet list of 6-15 invariants directly in the Subject ("**Settled design invariants for T<N>:**" followed by short bullets). The deterministic markdown-link extractor is a fallback when no inline invariants are available; apply caps (max 5 files, max 50 KB combined; aggregate cap 120 KB with TOC fallback above).
+5. **Design refs**: prefer **inline invariants** over embedding full design docs. Embedding a large design doc with its own review-loop transcript makes Codex exhaust its context window on prior-round metadata that is irrelevant to the shape check. Instead, distill the design into a bullet list of 6-15 invariants directly in the Subject ("**Settled design invariants for T<N>:**" followed by short bullets). The deterministic markdown-link extractor is a fallback when no inline invariants are available; apply caps (max 5 files, max 50 KB combined; aggregate cap 120 KB with TOC fallback above).
 6. **Context Manifest**: a YAML block (see `docs/archive/reviewCoordShape.md` final design for the schema) recording task_hash, deps_hashes, design_refs with hashes+sizes+loaded-state, aggregate sizes, preflight ran/findings, and provenance. The skill ALSO writes a canonical JSON sidecar `.coord/shape-reviews/<id>.cache.json` over the identity-only subset, with `manifest_hash` (SHA256 over canonical JSON bytes per RFC 8785 JCS) recorded in the YAML.
 
 ### Step 4 — Round 1: Codex semantic review
@@ -70,6 +70,7 @@ codex exec --cd <canonical-project-root> --sandbox workspace-write \
    (g) Fast-path/dry-run contradictions: if a subtask describes --dry-run, --schema-only, --offline, --no-network, etc., does the acceptance test agree on what that mode allows?
    (h) Existence: every file path in plan or scope must exist OR be listed in `scope_creates:` OR be described as 'creates' in a subtask body.
    (i) Credential leakage: any literal in the task text that looks like a real password fragment, API key, token, or wallet path. Flag even partial leaks (the original incident leaked a 7-char password prefix into an acceptance grep regex).
+   (j) Subtraction analysis: do the four answers consider changing or deleting existing behavior, identify resulting orphans, agree with the frontmatter LOC band, and justify any growth without retirement? Check the plan and acceptance cover promised removals. Do not demand cuts solely to clear the status advisory or accept generic slogans as evidence.
 
    Emit a numbered findings list. If nothing substantive remains, emit a standalone CONVERGED line.
    Append your entire response as ONE new section titled '## Codex shape-review round N (YYYY-MM-DD)' to the transcript. Append only — do not modify other parts." \
@@ -94,7 +95,7 @@ Same as steps 4–5 with the updated task. Cap at round 2; if not converged, sur
 
 ### Step 7 — Final mechanical invariant
 
-Re-run `coord-review tasks/<id>.md`. The semantic fixes must not have broken the mechanical gates. If it fails, fix and re-run until LGTM.
+Re-run `coord-review` on the `coord show <id> --path` file. The semantic fixes must not have broken the mechanical gates. If it fails, fix and re-run until LGTM.
 
 ### Step 8 — Persist cache and report
 
@@ -119,7 +120,6 @@ Write `.coord/shape-reviews/<id>.cache.json` (canonical JSON) and report:
 ## Rules
 
 - Never hand-edit task files. All fixes go through `coord update`.
-- Never `--shape-override` a finding without recording a reason via the supported CLI surface.
 - Run on `status: shaping` or `needs-review` tasks only. Reject `pending`, `*-working`, terminal statuses.
 - Persist the transcript so the next session can verify what was checked.
 - Cache hits must verify `manifest_hash` byte-for-byte (canonical JSON) before trusting.

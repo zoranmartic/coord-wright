@@ -28,11 +28,13 @@ shapes:
   - they may set Codex/tag defaults, but they do not skip shaping,
     subtask metadata, Plan, acceptance, verifier, or release validation
 - Brainstorm task:
-  - create with `--brainstorm`
-  - leave it off-queue in `needs-brainstorming`
+  - create with `--brainstorm` (exempts the subtask requirement and seeds a
+    placeholder Plan); it still lands in `shaping` unless you also pass
+    `--status=needs-brainstorming`
   - resolve ambiguity before writing a runnable `Plan`
 - Codex-default task:
-  - `Plan` is auto-seeded as `[n/a — codex-only task]`
+  - `Plan` is seeded with the same placeholder as every task and must be
+    replaced before promote (`[n/a — codex-only task]` also counts as a placeholder)
   - Codex completes directly unless `roles.reviewer` is explicitly configured
 - Claude-only task:
   - keep the same overall body shape, but Codex findings are skipped
@@ -44,24 +46,26 @@ task enters any runnable queue; brainstorm drafts remain off-queue), then use
 `coord update --set-acceptance-test=...` to fill the remaining body
 deliberately.
 
-Task-shape enforcement defaults to strict. Any runnable `coord new` or
-`coord update --set-subtasks` that emits task-shaping warnings fails instead
-of only warning. Use `--brainstorm` to capture unclear work off-queue, or
-`--shape-override=<reason>` only for an explicit human-approved exception; the
-override reason is persisted in `shape_override`. Projects that intentionally
-want the old warning-only behavior can set `COORD_TASK_SHAPE_ENFORCEMENT=warn`.
+`coord new --tags=...` preserves supplied tags alongside the default
+`coordination` tag and the compatibility `overnight` tag when applicable, with
+duplicates removed. `coord update --tags=...` replaces the complete tag list;
+include `coordination` explicitly when it should remain.
 
-**Subtasks are mandatory before a task enters a runnable queue.** Plain `coord new` defaults to `status: shaping`, so it may create an off-queue draft without `--set-subtasks`. Runnable creation with `--status=pending` or `--status=needs-review` requires `--set-subtasks=<str>` unless the task is still held with `pickup_hold: true`. Promotion from `shaping` or `needs-brainstorming`, hold release, and hold clearing all validate that the task has at least one parseable subtask carrying `complexity`, `model_claude`, and `model_codex` metadata, plus task-level `complexity`, `kind`, `reasoning_effort`, a concrete `Plan`, and acceptance or verifier intent. `--shape-override`, `--solo`, and `--overnight` do not bypass runnable subtask validation.
+Task-shape checks are strict: any runnable `coord new` or
+`coord update --set-subtasks` whose shape validation fails is rejected. Use
+`--brainstorm` to capture unclear work off-queue; there is no bypass flag.
 
-**Verifier profiles are explicit finish-line metadata.** `verify_profile` accepts `html5`, `pptx-html`, or `lab-brief`. The worker captures PPTX text baselines before a `pptx-html` round under ignored `.coord/artifact-baselines/`, then runs `coord-verify-artifacts` after the agent exits. HTML validation uses Nu Html Checker `vnu` (Homebrew `vnu` is installed on demand when possible); Apple `/usr/bin/tidy` is not accepted for HTML5. Verifier failures route to `needs-review` when `roles.reviewer` is set, otherwise to `needs-brainstorming`. Tasks that modify `.pptx`, `.docx`, or `.xlsx` artifacts must use `verify_profile: pptx-html` and an explicit reviewer unless they are read-only review tasks.
+**Subtasks are mandatory before a task enters a runnable queue.** Plain `coord new` defaults to `status: shaping`, so it may create an off-queue draft without `--set-subtasks`. Runnable creation with `--status=pending` or `--status=needs-review` requires `--set-subtasks=<str>` unless the task is still held with `pickup_hold: true`. Promotion from `shaping` or `needs-brainstorming`, hold release, and hold clearing all validate that the task has at least one parseable subtask carrying `complexity`, `model_claude`, and `model_codex` metadata, plus task-level `complexity`, `kind`, `reasoning_effort`, a concrete `Plan`, and acceptance or verifier intent. `--solo` and `--overnight` do not bypass runnable subtask validation.
+
+**Verifier profiles are explicit finish-line metadata.** `verify_profile` accepts `html5`, `pptx-html`, or `lab-brief`. The worker captures PPTX text baselines before a `pptx-html` round under ignored `.coord/artifact-baselines/`, then runs `coord-verify-artifacts` after the agent exits. HTML validation uses Nu Html Checker `vnu` (not auto-installed: `html5` fails with install advice when it is missing, `lab-brief` skips the HTML check); Apple `/usr/bin/tidy` is not accepted for HTML5. Verifier failures route to `needs-review` when `roles.reviewer` is set, otherwise to `needs-brainstorming`. Tasks that modify `.pptx`, `.docx`, or `.xlsx` artifacts must use `verify_profile: pptx-html` and an explicit reviewer unless they are read-only review tasks.
 
 **Token usage should be recorded for every wrapper-managed round.** Token telemetry is informational and non-blocking by default: wrappers log warnings for missing or suspicious usage, update `token_warnings` when possible, and keep task throughput moving. `coord token-audit --include-archive` reports incomplete telemetry for active and archived tasks. Do not backfill historical rows with guessed counts.
 
 `completed` is written when a task transitions to `done`. When a task has token data, the rendered `## Token usage` section shows per-round rows and warning lines. `effective` is an API-parity proxy weighted per provider's published rate card — Claude: `input + 5*output + cache_read/10 + cache_create*5/4`; Codex GPT-5.5: `input + 6*output + cache_read/10`. See coordination.md § "Token attribution" for full formula text and rationale. Cache reads are tracked separately AND counted toward `effective` at the documented discount rate (0.1× for both providers). Suspicious rows include missing usage blobs, all-zero rows, cache-only rows, and `output=0` when agent-visible work was produced. Wrapper-managed Codex rounds should produce a `codex` token row only when the Codex wrapper actually ran; a missing Codex row usually means Claude handed work to Codex internally or telemetry failed.
 
-Completed subtasks keep their checkbox entry in `## Scope notes` and gain an inline completion stamp: `- [x] **S2: Example** - done 2026-04-09T14:22:00Z`.
+Completed subtasks keep their checkbox entry in `## Scope notes`; `--complete-subtask` only flips `[ ]` to `[x]` (no completion stamp).
 
-Existing tasks can be reshaped through `coord update`, including `--depends_on=...`, `--review_rounds_max=<n>`, and `--max_turns=<n>` when a queued task needs a larger per-round CLI-turn budget. The worker enforces a floor of 60 turns, so the task value only raises that budget; exceeding the effective budget moves runnable tasks to `needs-brainstorming` unless the update uses `--force`. The runnable content hash now reflects execution-shaping frontmatter and current dependency blockers, so queue-shape changes and dependency unblocks are treated as fresh work instead of being suppressed as "unchanged."
+Existing tasks can be reshaped through `coord update`, including `--depends_on=...`, `--review_rounds_max=<n>`, `--complexity=<trivial|simple|complex|xhigh>` (validated; the baseline check runs against the new complexity together with any model/effort flags in the same call, e.g. `--complexity=simple --model_claude=sonnet`), and `--max_turns=<n>` when a queued task needs a larger per-round CLI-turn budget. The worker enforces a floor of 60 turns, so the task value only raises that budget; a round that hits it is handled by the worker's max-turns path (see `max_turns`), not by `coord update`. The runnable content hash now reflects execution-shaping frontmatter and current dependency blockers, so queue-shape changes and dependency unblocks are treated as fresh work instead of being suppressed as "unchanged."
 
 ## Role-specific execution overrides
 
@@ -73,14 +77,15 @@ to work unchanged.
 - `reasoning_effort_architect`: optional architect-round reasoning override. Priority chain is `reasoning_effort_architect` -> `reasoning_effort` -> project default.
 - `reasoning_effort_review`: optional reviewer-round reasoning override. Priority chain is `reasoning_effort_review` -> `reasoning_effort` -> project default.
 
-`coord pickup` exposes both the raw frontmatter values and the resolved
+`coord pickup` exposes a small task summary (id, status, assigned, task,
+pickup_hold, verify_profile, handoff) and the resolved
 round-specific execution fields (`round_role`, `resolved_model_*`,
 `resolved_reasoning_effort`, and their `_source` companions) so wrappers can
 launch the right model/depth without reproducing queue logic.
 For Codex pickups, the paired `codex_execution_policy` mirrors the resolved
 round role. Normal coder/subtask rounds complete directly: multi-subtask work
 marks the current subtask complete and stays `pending/assigned=codex`; the last
-subtask or non-subtask coder work completes through `review-passed --force`.
+subtask or non-subtask coder work completes through `review-passed` (no `--force`).
 Only tasks with explicit `roles.reviewer` enter `needs-review`. Explicit
 architect rounds still emit `work_mode: architect` and hand off to
 `roles.coder`, but that role is an opt-in escape hatch rather than a normal
@@ -88,21 +93,22 @@ task-shaping step. Reviewer rounds emit `work_mode: reviewer`, skip the plan
 gate, and close the task on successful review.
 
 There are intentionally no `model_codex_architect` or `model_codex_review`
-fields today. Codex uses a single model chain for every round:
-`model_codex` -> project `CODEX_MODEL` -> CLI default. Role-specific Codex
-tuning is handled through `reasoning_effort_architect` and
-`reasoning_effort_review` instead of widening unattended wrapper model
-selection.
+fields today. Codex uses a single model chain for every round: subtask
+`model_codex` (coder rounds) -> task `model_codex` -> project `CODEX_MODEL` ->
+CLI default. Role-specific Codex tuning is handled through
+`reasoning_effort_architect` and `reasoning_effort_review` instead of widening
+unattended wrapper model selection.
 
-The handoff render used by `show --handoff` and pickup payloads keeps `Rules`,
-`Claude latest`, `Codex latest`, `Open issues`, and `Lessons learned` bounded
-to the shared 20+20 truncation policy. Longer sections show the same
-`[... N lines truncated ...]` marker used for verify-command failures.
-Wrappers consume that same bounded `task.handoff` payload directly from
-`coord pickup`, so the default startup path does not need extra queue reads
-just to reconstruct those sections.
+The handoff render used by `show --handoff` and the pickup payload's
+`task.handoff` is a short header only: id, task, status/assigned/round, queue
+and execution timing, `acceptance`, `verify_commands`, `verify_profile`, and
+`scope_budget`. It does not include Plan, subtasks, findings, issues, or
+lessons; read those with `show <id> --compact` (frontmatter plus the first 50
+body lines), `coord next-subtask <id>`, or full `show <id>`.
 
-Task files may include a derived `## Task parameters` section near the top of the body. That section mirrors the most useful frontmatter fields as a fenced YAML block so Markdown preview can still show task parameters when the editor hides YAML frontmatter. It is informational only; the frontmatter remains the source of truth.
+`coord new` writes a static `## Task parameters` section containing
+`_See frontmatter above._`; it is never updated. The frontmatter is the source
+of truth.
 
 ## Task shaping and granularity
 
@@ -118,11 +124,12 @@ Task creation is an architecture step. An agent asked to "create a task" should 
 
 Shaping is not complete when the Markdown file merely exists. A `status:
 shaping` task is handoff-ready only when the next agent can start from
-`coord show <id> --handoff` without rediscovering intent, boundaries, or the
-finish line. Before promoting or leaving shaped tasks for another agent, ensure
-the handoff has:
+`coord show <id>` without rediscovering intent, boundaries, or the finish
+line. The mechanical bar is `coord promote` validation
+(`validate_runnable_shape`) plus the `coord-review` skill; `show --handoff`
+does not render the Plan or subtasks. Before promoting or leaving shaped tasks
+for another agent, ensure the task has:
 
-- an actionable current focus, not `[no scoped focus yet]`;
 - a concrete `## Plan` that states what to change and what not to change;
 - a concrete `## Acceptance test` with the final command or observable end
   state;
@@ -137,7 +144,7 @@ Use `coord update --set-plan=...`, `--set-acceptance-test=...`,
 task files directly. Preserve `status: shaping` while improving task metadata
 unless the user explicitly asks to queue, start, or complete the task.
 
-`coord new` and `coord update --set-subtasks=...` now emit shaping warnings when they detect broad scopes, too many acceptance items, high-risk work that skips architect/reviewer-grade metadata, or subtasks that mix multiple surfaces such as backend + docs + verification in one step. By default, those warnings are fatal for runnable tasks unless the task is kept off-queue with `--brainstorm` or a human supplies `--shape-override=<reason>`. Treat any warning as a prompt to split the task or raise the task architecture before another expensive round.
+`coord new` and `coord update --set-subtasks=...` emit shaping warnings when they detect broad scopes, too many acceptance items, high-risk work that skips architect/reviewer-grade metadata, or subtasks that mix multiple surfaces such as backend + docs + verification in one step. Those warnings are fatal for runnable tasks unless the task is kept off-queue with `--brainstorm`. Treat any warning as a prompt to split the task or raise the task architecture before another expensive round.
 
 Task creation checklist for new runnable work:
 
@@ -212,7 +219,7 @@ sketches — minimal, flexible, common-case-optimised — and recommend one
 before queueing the coder. Worth `reasoning_effort_architect: high` for
 non-trivial seams.
 
-**Empty findings pruning:** When serializing, `Claude findings` and `Codex findings` sections are omitted if they contain only placeholder text (`### Round N\n[not started]` or `### Round N\n[awaiting claude/codex]`). This keeps early-stage and single-agent task files smaller. Sections reappear automatically when real findings are appended. `parseFile` handles files with or without these sections — no migration needed.
+**Findings sections:** `coord new` always writes both `Claude findings` and `Codex findings` with `_No findings yet._`; nothing prunes them.
 
 ### Subtask handoff files
 
@@ -249,9 +256,14 @@ The subtask body in `## Scope notes` MUST carry:
 - For subtasks after S1: a `Reads handoff:` line naming the exact read path (the prior subtask's handoff).
 - For every subtask except the last: a `Handoff to S<N+1>:` line — one sentence the shaper writes at shape time, naming the specific artifact (signature, file, decision, partial output, invariant) the next subtask needs to start. The S<N> worker treats this as the spec for the `## Exports / types / functions added` section of its handoff file, so it does not have to guess what the next subtask needs.
 
-This removes worker-side improvisation about location, naming, and handoff content. No CLI-level enforcement is currently wired — the convention is enforced through `coord-shape` SKILL.md at shaping time. `parseFile` ignores `.coord/handoffs/` entirely; handoff files do not participate in task-file serialization.
+This removes worker-side improvisation about location, naming, and handoff content. Two CLI gates enforce it:
 
-**Brainstorm tasks:** When `coord new --brainstorm` is used, the file stores `status: needs-brainstorming` and writes an `## Ambiguity checklist` section instead of `## Plan`. Launchd triggers stay quiet until the task is explicitly moved back to an active queue such as `pending`. Promotion from `needs-brainstorming` back into a runnable queue automatically clears the queued side's content hash so precheck treats the activation as fresh work.
+- Shape time: `coord new`, `--set-subtasks`, `promote`, and `release` reject a subtask block missing `Writes handoff:`, `Reads handoff:` (after S1), or `Handoff to S<N+1>:` (all but the last).
+- Runtime: `coord update --complete-subtask=S<n>` exits 3 unless `.coord/handoffs/<task-id>/S<n>.md` exists on disk (only `--force` bypasses). Write the handoff file before the completing update.
+
+Handoff files do not participate in task-file serialization.
+
+**Brainstorm tasks:** `coord new --brainstorm` exempts the subtask requirement and writes the Plan placeholder `_Brainstorm task — ambiguity checklist drives first session._`; the task lands in `shaping` unless `--status=needs-brainstorming` is also passed. The watchdog triages only `needs-brainstorming`. Promotion into a runnable queue clears the queued side's content hash so precheck treats the activation as fresh work.
 
 ## Role-based frontmatter fields
 
@@ -433,7 +445,7 @@ Default when absent: the reviewer falls back to general-purpose review — check
 
 ### `verify_commands`
 
-A YAML list of shell commands forming the final acceptance gate. The reviewer role executes them from the repo root and outputs `APPROVE` only when every command exits 0 (see `agents/reviewer.md`); the watchdog re-runs them when diagnosing a stuck task. The `coord` CLI itself does not execute them — the mechanical, worker-run gate is `verify_profile` (`bin/coord-verify-artifacts`).
+A YAML list of shell commands forming the final acceptance gate. The reviewer role executes them from the repo root and outputs `APPROVE` only when every command exits 0 (see the reviewer round in `skills/coord-check/SKILL.md`); the watchdog re-runs them when diagnosing a stuck task. The `coord` CLI itself does not execute them, but the worker does: after any round that leaves the task `done` (coder-only close, reviewer close, or failure path), it re-runs every line via `bash -c` from the project root with the round timeout. Each command must exit 0 and leave the worktree unchanged (no new or modified files); otherwise the worker restores the verify-created changes and demotes the task with `--status=review-failed --force` back to the coder. Commands that build artifacts (`dist/`, coverage, unignored caches) or are not idempotent therefore loop the task. The same close guard demotes a done task whose current-round reviewer finding says `REJECT`. `verify_profile` (`bin/coord-verify-artifacts`) is a separate artifact gate.
 
 Reserve this list for the narrow final acceptance gate. Keep the list short and task-final. Do not put every smoke test or exploratory check you might run during implementation here; those local checks belong in the active subtask text or the relevant round finding. If a task needs multiple unrelated final gates, split it before the verify list turns into a second task plan.
 
@@ -445,7 +457,9 @@ verify_commands:
   - npm run lint
 ```
 
-Default when absent: no executable verification — `review-passed` updates are unrestricted.
+When present, the worker re-runs these commands from the project root (stdin closed) whenever a round leaves the task `done` — coder or reviewer — and demotes the task back to its coder if any command fails.
+
+Default when absent: no mechanical verify gate on close.
 
 ### `depends_on`
 
@@ -461,38 +475,61 @@ Current behavior:
 - Tasks with unmet dependencies remain in their queue status, but `precheck` and pickup helpers skip them until every dependency is either `done` in `tasks/` or already archived under `tasks/archive/`.
 - Missing dependency ids are treated as blocked, not as satisfied.
 - Ordering inside one task still comes from subtasks; `depends_on` is for cross-task sequencing only.
-- When a direct predecessor shares scoped files with the current task, `show <id> --handoff` and `show <id> --compact` include a capped `Predecessor carry-forward` section with the shared scope, shared final verification command when present, the predecessor's latest finding line, and the first carry-forward note from `Open issues` or `Lessons learned`. Treat that as the starting summary; use `show-signatures` or targeted file reads only when the summary is insufficient.
+- Among runnable tasks, pickup orders by `priority` ascending (default 5), then by id.
+- Nothing carries predecessor context forward automatically; read the predecessor's findings or handoff files directly.
 
 Default when absent: task has no cross-task dependency gate.
 
 ### `review_rounds_max`
 
-Integer. Maximum review rounds before escalation to `needs-brainstorming`.
+Integer. Maximum review rounds in a cross-side review loop before escalation
+to `needs-brainstorming`.
 
-This limit applies to cross-side review loops where the reviewer differs from
-the coder. Single-agent tasks and same-side reviewer tasks use `max_turns`
-instead, so repeated Codex-only or Claude-only subtask rounds do not
-accidentally escalate out of queue.
+`coord update --status=review-failed` from `needs-review` (a reviewer
+rejection) increments `review_round`. When that count reaches the cap, the
+same call parks the task in `needs-brainstorming` with `pickup_hold: true`,
+`assigned` set to the coder, and an Open issue naming the cap, instead of
+returning it to `pending`. So `1` allows one review and no fix loop, `2`
+allows one fix loop. A `--review-rounds-max` in the same update call applies
+to that rejection. To continue a parked task, raise `review_rounds_max` (or
+rescope), then release it.
 
-The counter advances when the task re-enters `needs-review` for a new
-cross-side review pass. It does not use the task's global `round` field, so
-architect handoffs, coder-only implementation rounds, and other non-review
-work do not consume the review cap by themselves.
+The cap applies only to cross-side loops: when `roles.coder` and
+`roles.reviewer` name the same agent, no cap applies (same-side loops stay
+bounded by `max_seconds`, the round token gate, and watchdog triage). Forced
+demotes from `done` (the worker's false-approve and mechanical verify guards)
+do not count.
 
-Default when absent: `1` for cross-side reviewer loops with explicit `roles.coder` and `roles.reviewer`; same-side and single-agent loops continue to use `max_turns`.
+`coord-review` also reads it: tasks whose title or tags match
+`money|auth|security|destructive|trading|rca|migration` must set
+`review_rounds_max >= 2` (and `complexity` of at least `complex`).
+
+Default when absent: no cap — the reject/fix loop continues until the
+reviewer approves or a human steps in. Set it to bound a cross-side loop.
+
+### `review_round`
+
+Integer, written by `coord update`: the number of reviewer rejections
+(`review-failed` from `needs-review`) so far. Never written by agents; the
+review cap compares it with `review_rounds_max`.
+
+Default when absent: `0`.
 
 ### `scope_budget`
 
-Optional. Per-task subtraction/addition envelope, surfaced to the worker via the
-pickup handoff payload. Advisory contract — the implementer aborts and surfaces
-findings when the actual diff exceeds the band, instead of finishing through.
-The CLI does not block on it; the discipline is enforced by the worker prompt
-and the post-task reviewer.
+Optional in the runtime task schema; required by `coord-review` when reviewing
+a shaped task. Per-task subtraction/addition envelope, surfaced to the worker via the
+pickup handoff payload. It is a **warning target, not a stop**: the
+implementer finishes the subtask, records actual vs target net LOC with a
+one-line reason in its finding, and the reviewer decides whether the overshoot
+is bloat. The CLI does not block on it. Stopping the coder at the threshold
+would halt a healthy implementation on an honest estimation miss, while a
+bloated change under the band would still pass untouched.
 
 ```yaml
 scope_budget:
   net_loc_delta_target: "-800 to -1200"   # or "+50 to +200" for a feature
-  abort_if_exceeded_by_pct: 50            # default 50 when target is set
+  abort_if_exceeded_by_pct: 50            # warning threshold; name kept for compatibility
 ```
 
 Write the field via `coord update <id> --scope-budget-loc='-800 to -1200'`
@@ -501,18 +538,31 @@ from the third grill question (net LOC delta target) in
 `${COORD_TOOLS:-$HOME/Projects/coord-wright}/skills/coord-shape/SKILL.md`
 § "Mandatory subtraction questions."
 
+`coord-review` requires a numeric band (`+50 to +200`, `0 to 0`, or
+`-800 to -1200`) and four non-placeholder list answers in `## Subtraction
+analysis` (or a `###` subsection inside the plan). The reviewing agent checks
+that the answers are concrete, the prose and frontmatter budgets agree, and
+the plan and acceptance cover promised removals. Justified growth with no
+retirement is valid. The status warning about three additive tasks is only a
+metadata heuristic, not a deletion quota. These shaping-review checks add no
+worker pickup or direct CLI promotion gate for existing queued tasks.
+
 How the worker uses it:
 
 - The pickup handoff payload includes a `scope_budget:` block listing the
-  target band, the abort percentage, and a one-line policy reminder.
-- The worker's execution prompt instructs: "if your final `git diff --stat`
-  exceeds the upper bound of the band by more than `abort_if_exceeded_by_pct`%,
-  STOP — append a note to `## Findings for follow-up` in the task file, do
-  not commit further, and surface the overshoot to the shaper."
-- The C5 case study from a real C1–C5 chain (target ≤350 added,
-  actual +712 — 2x overshoot) is the canonical example: the budget would have
-  triggered surface-and-stop and let the human decide whether to widen the
-  task, split it, or accept the overshoot with rationale.
+  target band, the warning percentage, and a one-line policy reminder.
+- The coder finishes the subtask regardless of the number. When the final
+  diff exceeds the band's upper bound by more than `abort_if_exceeded_by_pct`%,
+  the finding must carry `scope: actual +N vs target <band>` plus a one-line
+  reason. The only stop condition is overshoot caused by work outside the
+  declared `scope`/`scope_creates`.
+- The reviewer owns the verdict (see `skills/coord-check/SKILL.md`, reviewer
+  round): APPROVE with a note when the overshoot is explained and the code is
+  clean; REJECT on YAGNI bloat per `agent-workflow-policy.md`. A **negative**
+  band (`code-cut`, `refactor`) stays a hard criterion: net LOC above the band
+  is REJECT unless the finding names the cut that proved impossible.
+- Positive bands for feature work are estimates and tend to run low. Estimate
+  per file from `scope`/`scope_creates` rather than guessing a task total.
 
 Default when absent: no budget surfaces in the handoff; the worker proceeds
 under standard YAGNI/KISS implementation policy without a numeric ceiling.
@@ -527,7 +577,7 @@ Integer. Wall-clock budget per round in seconds. The worker resolves the effecti
 
 On timeout (exit code 124 SIGTERM or 137 SIGKILL after a 30-second grace window):
 - `terminal_reason=round_timeout` is logged to the worker log and agent-runs row.
-- Any `/tmp/<agent>-finding-<id>.txt` written before the timeout is preserved to `.coord/finding-<id>-<ts>.txt`.
+- The worker exports `COORD_AGENT_FINDING_FILE=/tmp/<agent>-finding-<project>-<id>.txt` and clears it before launch. Any finding written there before the timeout is preserved to `.coord/finding-<id>-<ts>.txt`.
 - The task routes to `needs-brainstorming` with an Open Issues note recording elapsed seconds and the timeout cap.
 - **No auto-requeue**. A wall-clock timeout means shaping is wrong; increase `max_seconds` and re-promote.
 
@@ -543,9 +593,8 @@ Integer. **Runaway-loop fuse.** The worker enforces a floor of 60 turns regardle
 
 Current behavior:
 
-- If a same-side or single-agent task exceeds `max_turns`, `coord update --round=...` moves it to `needs-brainstorming` unless the update uses `--force`.
-- If a cross-side review loop exceeds `review_rounds_max`, that is a hard escalation to `needs-brainstorming`.
-- If the agent exits non-zero for any non-rate-limit reason (verify failed, max-turns hit, OOM, API error), the worker commits any pending agent diff as `coord: tentative <id>`. For Claude max-turns exits specifically, the worker checks for progress (tentative commit or finding file written during the tick) and auto-requeues once at 3× the effective budget rather than immediately escalating; see `max_turns_retries_used` below. All other non-zero exits go to `needs-brainstorming` immediately. The watchdog diagnoses and resets fixable tasks; discard with `/coord-discard` if the work is irredeemable.
+- `coord update --round=...` only sets `round` and bumps `attempts`; `coord update` never checks `max_turns` (the review cap is `review_rounds_max`, checked on reviewer rejection).
+- If the agent exits non-zero for any non-rate-limit reason (verify failed, max-turns hit, OOM, API error), the worker commits any pending agent diff as `coord: tentative <id>`. For max-turns exits specifically (Claude `error_max_turns` or a Codex `turn.failed` turn-limit event), the worker checks for progress (tentative commit or finding file written during the tick) and auto-requeues once at 3× the effective budget rather than immediately escalating; see `max_turns_retries_used` below. All other non-zero exits go to `needs-brainstorming` immediately. The watchdog diagnoses and resets fixable tasks; discard with `/coord-discard` if the work is irredeemable.
 
 Default when absent: worker floor is 60; `bin/coord new` writes `4` or `12` for the task file value (now only meaningful as override-above-floor).
 
@@ -555,9 +604,9 @@ Integer. Number of automatic max-turns retries already consumed for this task. W
 
 - Valid values: absent (equivalent to 0) or 1. The worker caps auto-requeue at 1 attempt; a second max-turns exit on the same task always goes to `needs-brainstorming`.
 - The raised `max_turns` and this counter are intentionally not reset on task completion — they are audit state, not operational state, and the higher ceiling is usually appropriate if the task needed it once.
-- Codex max-turns detection is deferred; only Claude runs trigger auto-requeue.
+- Both Claude and Codex max-turns exits can trigger the auto-requeue.
 
-Default when absent: `6`.
+Default when absent: `0` (no retry used).
 
 ### Creator-owned defaults by complexity
 
@@ -587,13 +636,12 @@ When creating a task with `coord new` and no explicit `--assigned`, the `kind` f
 
 Explicit `--assigned` always takes precedence over kind-based routing. Single-agent tasks (`--agents=codex` or `--agents=claude`) auto-derive the assignee from the agent and ignore kind routing. Explicit `roles.architect` starts on the named architect.
 
-### Reviewer assignment (Q2 rule)
+### Reviewer assignment
 
-When a task transitions to `needs-review` without an explicit `--assigned`:
-
-1. **Default:** assign reviewer to the opposite side from whoever was last assigned (the coder).
-2. **Trivial tasks:** rejected — `complexity=trivial` tasks skip review entirely.
-3. **Explicit override:** passing `--assigned` on the update bypasses auto-assignment.
+`coord update --status=needs-review` without `--assigned` assigns
+`roles.reviewer` when it is `claude` or `codex`; otherwise `assigned` is left
+unchanged. An explicit `--assigned` always wins; the worker's resolved success
+commands pass it.
 
 ## Lifecycle flows
 
@@ -601,16 +649,18 @@ Default flows:
 
 - Canonical queue: `pending` is the normal runnable state. By default it is `assigned=codex`.
 - Codex-first no-review: `pending/codex -> codex-working -> pending/codex` for additional subtasks, then `done`.
-- Explicit review: `pending/codex -> codex-working -> needs-review/<reviewer> -> review-passed (transient) -> done`.
+- Explicit review: `pending/codex -> codex-working -> needs-review/<reviewer> -> review-passed (transient) -> done`; a rejection at the `review_rounds_max` cap parks in `needs-brainstorming` with `pickup_hold`.
 - Triage gate: `{agent failure} -> needs-brainstorming -> watchdog diagnoses -> pending` (or stays for human when not fixable)
-- Brainstorm gate: `{new task} -> needs-brainstorming -> pending after clarification`
+- Brainstorm gate: `{new task --brainstorm --status=needs-brainstorming} -> needs-brainstorming -> pending after clarification`
+- Transition table (`VALID_TRANSITIONS` in `bin/coord`): `done` is reachable only from `claude-working`, `codex-working`, or `needs-review`; `shaping`/`pending`/`needs-brainstorming -> done` and anything out of `done` need `--force`. Closing a never-started `shaping`/`needs-brainstorming` task to `done` skips the model/effort baseline check unless the same call sets a model, effort, complexity, or subtask field. `--status=done` is also refused while subtasks are incomplete unless `--force`. `--force` on an archived task with a non-done status moves it back to the tasks dir.
+- `coord promote` clears `pickup_hold`; `coord release <id>` releases a held task to `release_status` or its current status unless `--status=<status>` is given.
 - Shaping gate (default for plain `coord new`): `{new task} -> shaping -> pending via coord promote <id>`. Use shaping when scope is fine but you want a review window before launchd picks it up; use `--brainstorm` when scope is still unclear. `--solo` and `--overnight` do not skip shaping.
 
 ### needs-brainstorming recovery paths
 
 A task in `needs-brainstorming` is off-queue and will not be picked up by a worker until something explicitly transitions it. Three recovery paths are supported:
 
-1. **Watchdog auto-reset** — the `coord-unblocker` launchd agent (see `/coord-unblocker`) periodically diagnoses fixable escalations and moves them back to `pending` automatically. This is the default path for transient failures (rate limits, single max-turns trip, recoverable agent crashes).
+1. **Watchdog auto-reset** — the `coord-unblocker` launchd agent (see `/coord-unblocker`) periodically diagnoses fixable escalations and moves them back to `pending` automatically. This is the default path for transient failures (rate limits, single max-turns trip, recoverable agent crashes). The watchdog writes a human-required verdict **once**: it skips any task with `pickup_hold: true`, its diagnostician sets that hold when it concludes WRONG APPROACH or CANNOT AUTO-FIX, and two consecutive watchdog findings with no state change auto-hold the task. Release with `coord update <id> --pickup-hold=false --status=pending --force` after deciding.
 2. **Manual return to the runnable queue** — when the operator has read the escalation context and the task is ready to run as-is:
    ```bash
    python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" update <id> --status=pending
@@ -637,26 +687,14 @@ Explicit role flows:
 - **Architect**:
   Architect work starts in the normal assignee queue (`pending` with the architect named in `assigned`). After decomposition, hand off to the coder by keeping `status=pending` and switching `assigned` to the coder, then follow the same `working -> needs-review -> review-passed (transient) -> done` path as simple tasks.
 
-### Completion handoff
+### Local-only completion
 
 Completed tasks should normally land as committed and pushed wrapper output with
 no extra note. If the final completion path stays local-only instead — for
 example because wrapper-safe staging had to skip overlapping edits or the final
-`git push origin HEAD` failed — record that explicitly in `## Completion
-handoff` instead of leaving the task silently local-only.
-
-Use:
-
-```bash
-python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" completion-handoff <id> --note=@file-or-text
-```
-
-The helper works for both active and archived tasks. Clear the section after the
-local-only issue is resolved and the repo state is safely pushed:
-
-```bash
-python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" completion-handoff <id> --clear
-```
+`git push origin HEAD` failed — record that with
+`coord update <id> --add-issues="..."` instead of leaving the task silently
+local-only. There is no dedicated completion-handoff command.
 
 ## Usage
 
@@ -671,7 +709,6 @@ python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" status
 python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" list
 python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" show <id> --handoff
 python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" show <id> --compact
-python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" show-signatures <id>
 python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" update <id> --status=pending --assigned=codex
 python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" precheck
 ```
@@ -680,18 +717,39 @@ python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" precheck
 
 (Merged from the former `shaping-guide.md`. Cross-references: cross-agent workflow policy lives in `agent-workflow-policy.md` — that doc owns the canonical YAGNI / loop-bias / decomposition rules. This section adds the CLI-validation matrix, telemetry-derived ceilings, naming rules, and known CLI pitfalls.)
 
-### Default shaping matrix (CLI-enforced)
+### Shaping recommendations and CLI validation
 
-- `trivial` → `reasoning_effort=low`
-- `simple` implementation-heavy work → `reasoning_effort=medium`
-- `simple` design/review work or `complex` work → `reasoning_effort=high`
-- high-stakes money, auth, security, destructive, or RCA work → `reasoning_effort=xhigh`
-- `model_claude=haiku` only for cheap trivial work, `sonnet` for normal work, `opus` only for clearly high-stakes architect/reviewer work
-- `model_codex=gpt-5.6-sol` for normal work unless there is a confirmed reason to use another supported model
+Recommendations guide effort selection; the validator admits a wider set. Complexity describes the work, while effort describes the reasoning needed for its remaining decisions. Do not relabel a complex task to obtain a lower effort setting.
 
-`coord new`, `coord update`, and `coord promote` enforce these (complexity, model_claude, reasoning_effort) combinations as a fatal shape error. Off-baseline pairs such as `simple + opus` or `complex + haiku` exit non-zero and print the expected model for that complexity. Architect and reviewer role fields (`model_architect`, `model_review`, `reasoning_effort_architect`, `reasoning_effort_review`) are validated against a role variant of the matrix that additionally admits `opus` on `simple` and `complex` tasks: high-stakes reviews — security-touching, migrations, external contracts, externally published artifacts — should set `model_review: opus` (typically with `reasoning_effort_review: high`) while the coder stays on the complexity-matched model (policy 2026-06-12). For the coder fields there is no exception: align the model to the complexity or raise the complexity — there is no `--shape-override` for this check.
+| Complexity | Allowed coder Claude family | Allowed reasoning effort |
+| --- | --- | --- |
+| `trivial` | `haiku` | `low` |
+| `simple` | `sonnet` | `low`, `medium`, `high` |
+| `complex` | `sonnet`, `opus` | `medium`, `high`, `xhigh` |
+| `xhigh` | `opus` | `xhigh` |
 
-Additionally, `coord new` and `coord update` print a **non-fatal advisory** when `complexity:simple` is combined with `reasoning_effort:high` (or its architect/review variants) on `kind` in {`code-fix`, `refactor`, `docs`, `smoke-test`}. Worker telemetry shows these kinds run ~30% longer at `high` vs `medium` with little quality gain; either drop to `medium` or split the task first. Design/audit and high-stakes kinds are excluded — they legitimately want `high`.
+`coord new` and `coord update` reject task-level combinations outside this table. `coord promote` re-validates subtask complexity/model pairs, but does not recheck task-level effort against this table. Role fields (`model_architect`, `model_review`, `reasoning_effort_architect`, `reasoning_effort_review`) additionally admit `opus` on `simple` tasks.
+
+- Prefer `medium` for simple implementation with settled acceptance and affected callers/tests identified.
+- Prefer `high` for design/review or complex work with unresolved decisions. Complex implementation with a settled contract may use `medium`; validate any broader change with paired quality and consumption evidence first.
+- Retain `high` or `xhigh` for unresolved concurrency, identity or security decisions; high-stakes money, auth, destructive work and serious RCA generally warrant `xhigh`.
+- Prefer `sonnet` for normal Claude work and `gpt-5.6-sol` for normal Codex work. High-stakes independent reviews can set `model_review: opus`, usually with `reasoning_effort_review: high`, without changing the coder model.
+
+The worker resolves effort from the current role override, then task-level `reasoning_effort`, then `CODEX_REASONING_EFFORT` or `CLAUDE_REASONING_EFFORT`, falling back to `medium`. It does not consume a subtask-level reasoning field. Keep active tasks unchanged during experiments.
+
+`coord new` and `coord update` emit a **non-fatal advisory** for simple/high combinations on `code-fix`, `code-cut`, `refactor`, `docs`, and `smoke-test` kinds. The advisory originated in local telemetry reporting about 30% longer runs with little quality gain; it is not a controlled benchmark for every current model or task class. Design/audit and high-stakes kinds are excluded.
+
+### Measuring an isolated Codex round
+
+The existing text and `--json` reports retain their output contracts. For a single explicit CLI rollout, use:
+
+```bash
+node bin/codex-coord-stats.js --round-summary --expect-cwd /tmp/exact-trial-checkout /absolute/path/to/rollout.jsonl
+```
+
+This opt-in JSON report includes session identity, exact cwd, model, effort, CLI version, first/last event timestamps, latest cumulative raw usage (including reasoning output), and model-issued tool-call events. It checks the session and turn cwd against the supplied path. It does not scan directories or count tool names mentioned in output. Function/custom-call outputs are excluded; calls inside an orchestration script are not separately represented by rollout call events.
+
+Raw `input_tokens` includes cached input; `uncached_input_tokens` subtracts that cache count. Cumulative snapshots are never summed. Missing counters stay `null`, including derived counts that require them; they are not free usage. Invalid JSON or a cwd mismatch exits nonzero. Record process exit status and elapsed time separately, retaining failed/interrupted attempts. The report is not a completion or quality certificate, and its event interval is not a substitute for process elapsed time. Use fresh, single-model sessions for paired trials; preserve identical code, brief, CLI, permissions and acceptance gates. Report uncached/cache and reasoning/other output separately; subscription quota consumption cannot be inferred from a fixed effective-token formula.
 
 For Codex models, prefer the stable `gpt-5.6-sol` ID by default, and never use unsupported aliases such as `codex-latest` or `codex-mini-latest` — `coord` rejects them, and the Codex CLI itself rejects `codex-latest` under a ChatGPT account.
 
@@ -723,7 +781,7 @@ Cost rule of thumb: a 16-message tick averages ~580 s; two 8-message subtasks av
 
 Two rules to apply on every `coord new`:
 
-1. **Title length discipline.** Auto-generated slugs truncate at ~60 chars and cut mid-word (`...classificatio` instead of `...classification`). Aim for `--task` strings that yield slugs under ~50 chars. Drop noise like `.py`, `route endpoints`, `compile`, `into unified file`. Push descriptive verbs to the front. Keep the verbose explanation in the Plan body, not the title.
+1. **Title length discipline.** Auto-generated slugs truncate at 50 chars after the date and cut mid-word (`...classificatio` instead of `...classification`). Aim for `--task` strings that yield slugs under ~50 chars. Drop noise like `.py`, `route endpoints`, `compile`, `into unified file`. Push descriptive verbs to the front. Keep the verbose explanation in the Plan body, not the title.
 
    - Bad: `"Backend audit: classify screening.py route endpoints"` → `2026-05-17-backend-audit-classify-screening-py-route-endpoint` (cut)
    - Good: `"Backend: classify screening operator routes"` → `2026-05-17-backend-classify-screening-operator-routes` (clean)
@@ -734,13 +792,13 @@ Two rules to apply on every `coord new`:
 
 **1. `--set-subtasks` rejects subtasks that mix surfaces + conjunctions.**
 
-Source: `bin/coord` `MAJOR_SURFACE_PATTERNS` and `validate_subtask_block` (around line 672-790). Surface patterns: `backend`, `frontend`, `ios`, `database`, `docs`, `tasks`, `worker`. Any subtask body that hits 2+ surfaces AND contains a conjunction (`and`, `,`, `;`, `plus`, `also`, `then`) is rejected.
+Source: `bin/coord` `MAJOR_SURFACE_PATTERNS` and `validate_subtask_block`. Surface patterns: `backend`, `frontend`, `ios`, `database`, `docs`, `tasks`, `worker`. Any subtask body that hits 3+ surfaces, or 2+ surfaces AND a conjunction (`and`, `,`, `;`, `plus`, `also`, `then`), is rejected.
 
 The trap is that "innocent" phrases trip surfaces unexpectedly: "dev server" → `server` → backend; "cd backend && alembic upgrade head" → backend + database; "PortfolioView.swift" → `swift` → ios; "from the backend" → backend. Fixes: replace path prefixes with relative paths, drop file extensions for cross-references, don't mention sibling surfaces in handoff text, and split per-surface verification into separate subtasks.
 
 **2. Embedded `##` headings in `--set-plan` and `--set-subtasks` mangle section bodies.**
 
-The parser treats `##` headings as task-file section boundaries, so a pasted mini-document with its own `##` headings can split or truncate the intended Plan or Scope notes content. Lead with prose, and use `###` or deeper headings inside any content passed to `--set-plan`, `--set-subtasks`, or `--set-acceptance`.
+The parser treats `##` headings as task-file section boundaries, so a pasted mini-document with its own `##` headings can split or truncate the intended Plan or Scope notes content. Worse, `--set-plan` replaces only the text under `## Plan`: embedded `## ` headings become sibling sections, and every rerun appends another copy of them (`coord-review` still passes). Lead with prose, and use `###` or deeper headings inside any content passed to `--set-plan`, `--set-subtasks`, or `--set-acceptance`.
 
 **3. `--set-subtasks` replaces the checklist from the first `- [ ] **S<N>:` entry onward.**
 

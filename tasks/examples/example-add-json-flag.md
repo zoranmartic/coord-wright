@@ -9,6 +9,8 @@ priority: 5
 scope:
   - src/cli/status
 tags: [example]
+scope_budget:
+  net_loc_delta_target: "+15 to +30"
 
 # Models — override if defaults aren't right
 model_claude: sonnet
@@ -61,11 +63,13 @@ pretty/compact toggle (see Subtraction analysis).
 
 ## Subtraction analysis
 
-- **Smallest version that delivers the value?** One `--json` flag on `status`,
-  reusing the existing status struct. No new abstraction.
-- **What are we consciously NOT building?** No `--format=<x>` plugin system, no
-  YAML, no pretty/compact toggle — those serve hypothetical second consumers.
-- **Net LOC band:** small positive (~+15–30). Not a `code-cut`.
+1. **Deletion alternative:** None; `status` has no machine-readable output
+   today. The flag reuses the existing status struct instead of adding a new one.
+2. **Orphans:** None; the human-readable renderer stays in use.
+3. **Net LOC delta target:** +15 to +30
+4. **Retirement:** None; the growth is one flag and one serializer call. A
+   `--format=<x>` plugin system, YAML, or a pretty/compact toggle would serve
+   hypothetical second consumers and are deliberately not built.
 
 ## Notes
 

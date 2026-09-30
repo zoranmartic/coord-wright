@@ -6,8 +6,13 @@ This command is for foreground/manual debugging. Wrapper-managed coord tasks
 must hand off to `assigned: codex` so the Codex wrapper records its own token
 usage.
 
+Run these commands with Bash (the prompt goes in a quoted heredoc so it is not shell-interpolated):
+
 mkdir -p .coord/codex-runs
-codex exec --sandbox workspace-write "$ARGUMENTS" 2>&1 | tee -a .coord/codex-runs/$(date +%s).log
+codex exec --sandbox workspace-write "$(cat <<'CODEX_PROMPT'
+$ARGUMENTS
+CODEX_PROMPT
+)" < /dev/null 2>&1 | tee -a .coord/codex-runs/$(date +%s).log
 git diff --stat
 
 The sandboxed `workspace-write` mode is deliberate for a foreground command.

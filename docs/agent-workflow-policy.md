@@ -106,6 +106,8 @@ Both agents must apply these rules when implementing any coord task or interacti
 
 When a finding from coord-shape-review, codex review, or interactive feedback proposes ADDING one of the above patterns, justify it against this list before accepting. The default disposition is "reject, simplify what's there." When in doubt: write the smaller version, ship it, and let the second real requirement drive the next abstraction.
 
+**Who enforces it.** The coder applies the eight rules while writing; the reviewer round is the check. `scope_budget` (task-files-reference.md) is a warning target the reviewer reads, not a stop the coder obeys: an overshoot with a stated reason and clean code is APPROVE plus a `scope:` note; an overshoot made of the patterns above is REJECT with the pattern named as `Root cause`. A negative band on a `code-cut`/`refactor` task is the one hard number, because subtraction is the deliverable there. Tasks shaped without `roles.reviewer` rely on the coder's actual-vs-target note in its finding and on the post-task review ladder below.
+
 ## Review Findings Are Tasks, Not Edits
 
 When any review tool (`codex-loop`, `ultrareview`, `/review-code`, `/review-security`, `/review-ui`, `/review-migration`, `/review-contract`, `/review-ops`, or the post-task coord reviewer) returns findings, the default response is to TRIAGE them into a `tasks/findings/<date>-<topic>.md` document and SHAPE the ones worth fixing into new coord tasks via `coord-shape`.

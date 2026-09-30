@@ -82,7 +82,8 @@ When an agent exits non-zero, the worker runs the following recovery sequence:
 ```
 rc != 0
     │
-    ├─▶ rate-limit?  ──yes──▶  set sleep-until marker, exit (retry next tick)
+    ├─▶ rate-limit?  ──yes──▶  set sleep-until.<agent>, restore task,
+    │                              commit scoped tentative edits, exit
     │
     ├─▶ save agent-runs JSON snapshot for post-mortem
     │
@@ -104,7 +105,7 @@ rc != 0
     │       ├─▶ CURRENT_STATUS == done  ──▶  exit 0 (clean finish before rc)
     │       ├─▶ progress check:
     │       │       (a) TENTATIVE_COMMITTED == 1, OR
-    │       │       (b) /tmp/claude-finding-<id>.txt exists, non-empty, mtime >= tick start, OR
+    │       │       (b) COORD_AGENT_FINDING_FILE exists, non-empty, mtime >= tick start, OR
     │       │       (c) git commit on task file with ct >= tick start + "claude-finding" in subject
     │       │   no progress  ──▶  fall through to needs-brainstorming
     │       └─▶ with progress:

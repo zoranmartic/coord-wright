@@ -29,8 +29,8 @@ task: Refactor AWR report formatter to use template engine
 status: pending
 assigned: codex
 round: 2
-created: 2026-04-09T10:15:00Z
-updated: 2026-04-09T14:22:00Z
+created: 2026-04-09T10:15:00+0100
+updated: 2026-04-09T14:22:00+0100
 scope:
   - file/a.sql
   - file/b.py
@@ -62,44 +62,7 @@ review_rounds_max: 1
 
 ## Task parameters
 
-_Rendered from task frontmatter for Markdown preview. Reserve `verify_commands` for the final `review-passed` gate; keep local smoke checks in subtask text or round findings._
-
-```yaml
-id: 2026-04-09-refactor-awr-report-formatter
-task: Refactor AWR report formatter to use template engine
-status: pending
-assigned: codex
-round: 2
-created: 2026-04-09T10:15:00Z
-updated: 2026-04-09T14:22:00Z
-scope:
-  - file/a.sql
-  - file/b.py
-tags:
-  - coordination
-  - project-name
-priority: 5
-max_turns: 3
-complexity: simple
-kind: refactor
-reasoning_effort: high
-model_architect: opus
-model_review: sonnet
-reasoning_effort_architect: xhigh
-reasoning_effort_review: medium
-depends_on:
-  - 2026-04-08-bootstrap-api
-roles:
-  architect: skip
-  coder: codex
-  reviewer: claude
-acceptance:
-  - Template engine renders all AWR sections
-  - No regression in existing report output
-verify_commands:
-  - node test-coord.js
-review_rounds_max: 1
-```
+_See frontmatter above._
 
 ## Scope notes
 
@@ -163,9 +126,10 @@ required sections through the template path, and `node test-coord.js` passes as
 the final review gate.
 ```
 
-For brainstorm-only tasks created with `coord new --brainstorm`, replace
-`## Plan` with `## Ambiguity checklist` and keep the task off-queue until the
-checklist is resolved and the task is promoted back into a runnable state.
+`coord new --brainstorm` keeps `## Plan` but seeds it with the placeholder
+`_Brainstorm task — ambiguity checklist drives first session._`; replace it
+with a concrete Plan before promoting. There is no `## Ambiguity checklist`
+section.
 
 `coord` may also render `## Token usage` for tasks that accumulate token
 metadata. That section is derived from `token_log` and `token_warnings`
@@ -174,15 +138,14 @@ such as `closed-stdin` are recorded separately in `runtime_warnings`.
 
 ## Section guide
 
-The body sections are serialized in two groups:
+`coord new` writes `Task parameters`, `Scope notes`, `Plan`, `Acceptance
+test`, `Claude findings`, `Codex findings`, `Open issues`, `Resolved issues`
+in that order; `coord update` replaces sections in place or appends new ones.
+No CLI flag creates `Rules`, `Lessons learned`, or pre-fetched signatures;
+they appear only in older or hand-migrated tasks. Section purposes, in the
+legacy reference order:
 
-1. fixed built-in sections in the serializer
-2. additional sections such as `Plan`, `Ambiguity checklist`, and `Acceptance test`, appended afterward in insertion order
-
-Use this order when reading or describing task files, even if some sections are
-empty or omitted in compact views:
-
-1. `## Task parameters` — derived from frontmatter for Markdown preview. Informational only.
+1. `## Task parameters` — static `_See frontmatter above._` placeholder.
 2. `## Scope notes` — scoped paths, executable subtasks, pre-fetched signatures, and prior lessons carried into the work.
 3. `## Rules` — hard constraints for this task.
 4. `## Claude findings`
@@ -191,12 +154,12 @@ empty or omitted in compact views:
 7. `## Resolved issues`
 8. `## Lessons learned`
 9. `## Token usage` when token data exists
-10. `## Plan` or `## Ambiguity checklist`
+10. `## Plan`
 11. `## Acceptance test`
 
 Use each section for one purpose:
 
-- `Task parameters`: mirrored metadata only. The YAML frontmatter remains the source of truth.
+- `Task parameters`: static placeholder. The YAML frontmatter is the source of truth.
 - `Scope notes`: the operational work area. Put `S1`, `S2`, ... subtasks here, not in `Plan`.
 - `Rules`: task-specific non-negotiables, guardrails, exclusions, and routing constraints.
 - `Claude findings` / `Codex findings`: round-stamped implementation or review notes. Keep local smoke checks here.
@@ -204,7 +167,6 @@ Use each section for one purpose:
 - `Resolved issues`: closed items moved out of `Open issues`.
 - `Lessons learned`: durable takeaways worth carrying to later overlapping tasks.
 - `Plan`: short strategy for runnable tasks. It should frame the work, not duplicate the subtasks.
-- `Ambiguity checklist`: brainstorm-only replacement for `Plan` while the task is still being shaped.
 - `Acceptance test`: the human-readable final end state and review gate.
 - `Token usage`: derived telemetry only. Token warnings are informational and
   non-blocking by default.
@@ -213,33 +175,35 @@ Use each section for one purpose:
 
 Use the smallest task view that unblocks the current round:
 
-1. Start with the wrapper-resolved handoff packet or `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" show <id> --handoff`.
-2. Fall back to `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" show <id> --compact` only when you need the broader scoped summary or recent issue history.
-3. Use `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" show-signatures <id>` for file-structure context before opening full files.
-4. Read only the specific scoped file or section you need next.
-5. Use full `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" show <id>` only when a specific missing detail still blocks the work after the earlier steps.
+1. Start with the wrapper-resolved handoff packet or `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" show <id> --handoff` (a short header: status, acceptance, verify_commands, scope_budget) plus `coord next-subtask <id>`.
+2. Fall back to `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" show <id> --compact` (frontmatter plus the first 50 body lines) for the Plan and subtask list.
+3. Read only the specific scoped file or section you need next.
+4. Use full `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" show <id>` only when a specific missing detail still blocks the work after the earlier steps.
 
-For `depends_on` follow-on work, treat the handoff packet's capped predecessor carry-forward section as the starting summary instead of re-reading the predecessor task from scratch.
+For `depends_on` follow-on work, read the predecessor's handoff files or latest finding directly; nothing is carried forward automatically.
 
 ## Statuses
 
 Off-queue (launchd ignores these):
 
-- `needs-brainstorming` — triage gate; created by `coord new --brainstorm` or set by the worker on agent failure. Watchdog diagnoses and resets to `pending` when fixable; a human reviews findings when not.
-- `shaping` — default for plain `coord new`; off-queue while a human reviews scope, acceptance, and the Plan section. Promote with `coord promote <id>` before launchd or skills will pick it up. `--brainstorm` also stays off-queue in `needs-brainstorming`.
+- `needs-brainstorming` — triage gate; created by `coord new --status=needs-brainstorming` or set by the worker on agent failure. Watchdog diagnoses and resets to `pending` when fixable; a human reviews findings when not.
+- `shaping` — default for plain `coord new`; off-queue while a human reviews scope, acceptance, and the Plan section. Promote with `coord promote <id>` before launchd or skills will pick it up. `coord new --brainstorm` also lands here unless `--status=needs-brainstorming` is passed.
 
-Runnable:
+Runnable (pickup orders by `priority` ascending, default 5, then id):
 
 - `pending` — canonical queued state; whichever agent is named in `assigned` owns the next pickup
+- `needs-review` — coder finished and an explicit reviewer is assigned
+
+Active and terminal (not picked up):
+
 - `claude-working` — Claude is actively working
 - `codex-working` — Codex is actively working
-- `needs-review` — coder finished and an explicit reviewer is assigned
-- `done` — terminal; task archived
+- `done` — terminal; `coord update --status=done` archives the file in the same call
 
 Transient (normalised by `coord update` before writing):
 
 - `review-passed` — reviewer approval command; persists as `done`
-- `review-failed` — reviewer rejection command; persists as `pending` with `assigned` reset to the coder
+- `review-failed` — reviewer rejection command; persists as `pending` with `assigned` reset to the coder, or parks in `needs-brainstorming` with `pickup_hold` once `review_rounds_max` is reached
 
 Tasks may name an `architect` role explicitly, but there are no dedicated
 `needs-architect` or `architect-done` queue states. Normal design and

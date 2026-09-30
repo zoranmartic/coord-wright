@@ -13,11 +13,11 @@ Optional: task id (e.g. `2026-05-13-some-task-id`). If omitted, infer the most r
 
 1. **Resolve the task file.**
    - If a task id was provided, find it in the project task directory.
-   - If not, run:
+   - If not, list the shaping ids:
      ```bash
      python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" list --status=shaping --format=ids
      ```
-     Pick the first result (most recently updated).
+     Ids come oldest-first (date-prefixed filenames); take the last one as the latest shaped task. If several are in `shaping`, name the one chosen so the user can correct it.
    - Resolve the full path to the task file using the project task directory.
 
 2. **Run the validator.**
@@ -26,10 +26,11 @@ Optional: task id (e.g. `2026-05-13-some-task-id`). If omitted, infer the most r
    ```
 
 3. **Interpret results.**
+   - Before reporting LGTM, read all four subtraction answers: do they address the actual deletion alternative, resulting orphans, budget, and retirement or justified growth? Confirm the third answer agrees with the frontmatter band. The validator checks structure, not whether prose is credible. Bare "none", repeated policy slogans, or unanswered questions need task-specific reasoning. A justified decision to retire nothing is valid; do not invent cleanup or relabel a task to clear the status advisory. Apply this semantic check even when `coord-shape-review` is skipped for simple work.
    - Exit 0: print `LGTM — no shaping objections found for <task-id>.`
    - Exit 1: present each numbered objection from stdout and ask:
      > "I can fix these inline — want me to apply the fixes and re-run the check?"
-     If yes, apply targeted fixes via `coord update` commands or direct SKILL file edits, then re-run `coord-review` and confirm exit 0 before reporting done.
+     If yes, apply targeted fixes via `coord update` (never edit the task file directly), then re-run `coord-review` and confirm exit 0 before reporting done.
 
 4. **xhigh task extra prompt.**
    - If `reasoning_effort: xhigh` is on the task, also ask:

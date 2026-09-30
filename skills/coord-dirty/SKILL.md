@@ -20,8 +20,7 @@ commits, branches, or launchd services from this skill.
 2. Report the helper output plainly. Preserve the distinction between proven
    state and `likely_owner`; likely ownership is a heuristic from task status,
    worker locks, worker logs, branch names, and dirty status.
-3. If the output is longer than 40 lines, summarize by project and include the
-   dirty worktree rows plus worker hints. Do not hide helper errors.
+3. If output is long, show the head and tail with a `[... N lines truncated ...]` marker and always keep FAIL/WARN lines. Summarize by project, keeping dirty worktree rows and worker hints. Do not hide helper errors.
 
 ## Interpretation
 

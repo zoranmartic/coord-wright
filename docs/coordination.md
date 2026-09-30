@@ -17,7 +17,9 @@ Each project repo contributes only:
 
 - `.coord/config.env`
 - `tasks/`
-- project-specific launchd plists under `tools/`
+
+`install.sh` generates each project's launchd plist at
+`~/Library/LaunchAgents/com.coord.worker.<name>.plist`; nothing lives in the repo.
 
 Task storage paths are configurable through `.coord/config.env` or the environment:
 
@@ -37,7 +39,6 @@ python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" precheck [--assi
 python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" pickup --assigned=claude|codex
 python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" show <id> --handoff
 python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" show <id> --compact
-python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" show-signatures <id>
 python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" update <id> ...
 ```
 
@@ -206,7 +207,6 @@ When a wrapper is launched by `launchd`, the project plist provides the project
 path and the worker loads `.coord/config.env` from that checkout without
 executing it as shell code. That file usually provides:
 
-- `COORD_PROJECT_LABEL`
 - `COORD_REPO_ROOT`
 - `COORD_PROJ_DIR`
 - `COORD_TOOLS`
@@ -236,12 +236,13 @@ iPhone Claude sessions accumulate conversation history (50–100K+ tokens). MacB
 
 ## Output noise reduction
 
-Verbose command output is bounded before reaching either agent through `coord`'s shared `truncateOutput()`:
+`coord` does not truncate command output. The worker only appends the last
+20-40 lines of a failing command to `.coord/worker.log`, and `show --compact`
+cuts the body at 50 lines.
 
-- `verify_commands` failure output is truncated to the first 20 + last 20 lines with a `[... N lines truncated ...]` marker before the validation error is raised.
-- Handoff `Rules`, `Claude latest`, `Codex latest`, `Open issues`, and `Lessons learned` sections are capped before being embedded in pickup packets or `show --handoff` output.
-
-The same 20+20 policy applies manually when an agent runs shell commands or tests during a session (output exceeding 40 lines should be truncated to first 20 + last 20 before pasting into a finding). This is the fallback for live tool output that does not pass through `coord`.
+The 20+20 policy is manual: when an agent runs shell commands or tests during a
+session, output exceeding 40 lines should be truncated to first 20 + last 20
+with a `[... N lines truncated ...]` marker before pasting into a finding.
 
 ## Review-round reasoning reduction
 
@@ -255,7 +256,11 @@ A `high` reasoning round on a large accumulated context consumes the same input 
 
 ## Transient provider-limit detection
 
-When either agent hits a temporary provider limit, the wrapper classifies the agent output artifact, records a retry-after marker, restores any `*-working` task back to its runnable pre-pickup state, and exits without escalating to `needs-brainstorming`. The next trigger after the window expires resumes normally.
+When either agent hits a temporary provider limit, the wrapper classifies the agent output artifact, records `.coord/sleep-until.<agent>`, restores any `*-working` task back to its runnable pre-pickup state and original assignee, commits and pushes scoped tentative edits, and exits without escalating to `needs-brainstorming`. Later ticks skip only that provider: already-assigned work for the other provider can continue, with no role reassignment. The limited provider resumes after its marker expires. Any out-of-scope dirt that cannot be included in the tentative commit still leaves the checkout fail-closed and requires the normal watchdog/human cleanup path.
+
+Capacity/overload errors without a recognized reset time retry after 1, 5, 10, 20, then 30 minutes, capped at 30 minutes per provider. A successful agent run clears that provider's `.coord/capacity-backoff.<agent>` state. Recognized reset times take precedence; quota/rate-limit errors without one retain the one-hour fallback. Retries occur on the first worker tick after the deadline.
+
+The first new tick removes the obsolete project-wide `.coord/sleep-until` marker. If its provider is still limited, the hardened classifier records the correct provider-specific deadline on that attempt.
 
 Detection is regex-based and extensible per project. Preferred generic override:
 
@@ -271,7 +276,6 @@ Every project using coord has these files. Treat them as shared workflow infrast
 
 - `.coord/config.env` — project identification, model defaults, regex overrides
 - `.vscode/tasks.json` — coord helper tasks (where present)
-- `tools/*.plist` — project-specific launchd plists
 
 These are intentionally machine-local on single-user setups. Template them before sharing the repo or using a second machine.
 
@@ -289,14 +293,16 @@ normal decomposition work.
 ## Operational Diagnostics
 
 ### Shaping bar
-`coord show <id> --handoff` is the real shaping bar. A task remaining in `status: shaping` is not meaningful unless the handoff packet is actually executable. Use `show --handoff` (not `precheck`) to review shaping tasks.
+The real shaping bar is `coord promote` validation (`validate_runnable_shape`) plus the `coord-review` skill. `show --handoff` is a short header without Plan or subtasks; review shaping tasks with `show <id>` or `show <id> --compact` (not `precheck`).
 
 ### Stall triage
 - Check `<project>/.coord/worker.state` when a coord run looks quiet — it shows the active phase, task id, agent, and update time while the worker is running.
-- `exceeded max run age` plus advancing rounds usually means a looping task under watchdog restarts, not a dead runner. Reroute the looping task rather than waiting.
+- Watchdog `worker stale (pid= age=Ns >= Ns)` restarts (after `COORD_WATCHDOG_WORKER_STALE_AFTER`, default 7200 s) plus advancing rounds usually means a looping task, not a dead runner. Reroute the looping task rather than waiting.
+- Forced demotes from `done` and release from hold emit model-baseline warnings instead of blocking the transition when only the model/complexity pair is off-baseline.
+- If a forced demote after a failed verify gate or reviewer REJECT fails, the worker makes a second-chance park in `needs-brainstorming` with `pickup_hold`, recording both failures.
 
 ### Archive failure
-`archived 0/1` from `archive-done` means `archiveTask()` found a duplicate active task that collided with the already-archived file. The trigger retries every 180 seconds until the duplicate is removed.
+There is no separate archive step: `coord update --status=done` moves the file to the archive dir in the same call. If a done task is still in `tasks/`, check `git status` and the update's stderr.
 
 ### Launchd diagnostics
 `launchctl print gui/$(id -u)/<label>` is the canonical launchd diagnostic — pair it with a live check (`lsof`, `ps`, `jps -l`, or logs) to confirm the service state.

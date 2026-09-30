@@ -15,7 +15,7 @@ Multi-agent coord (`roles.architect`, `roles.reviewer`, or shape-review on top o
 
 2. **Audit trail and decision persistence across sessions.** The coord task file holds plan, subtasks, findings, token_log, and the diff trail — visible from any session, surviving context window resets, queryable later. This is the user's stated primary reason for reaching for multi-agent.
 
-These two values are NOT the same need. **Audit trail does not require multiple tasks**, multiple agents, or shape-review. A single coord task with rich subtasks, structured findings, and the standard token_log already gives full persistence and visibility. Splitting one feature across N tasks does NOT improve the audit trail; it fragments context (per Cognition's analysis in `cognition.ai/blog/dont-build-multi-agents`: parallel subagents lose conversation history and make conflicting implicit decisions) AND inflates token spend for the same end result.
+These two values are NOT the same need. **Audit trail does not require multiple tasks**, multiple agents, or shape-review. A single coord task with rich subtasks, structured findings, and the standard token_log already gives full persistence and visibility. Splitting one feature across N tasks does NOT improve the audit trail; it fragments context (separate workers lose conversation history and make conflicting implicit decisions) and inflates token spend for the same end result.
 
 Apply these defaults when shaping:
 
@@ -56,9 +56,9 @@ Workflow:
    - Net LOC delta target — is this task net-negative, net-zero, or net-positive? Give a band (e.g. `-800 to -1200` for a cut, `+50 to +200` for a feature).
    - If net-positive: what existing complexity (env vars, configs, abstractions, feature flags, helper layers) gets retired as part of this work? If nothing, why not?
 
-   These four answers go verbatim into a `## Subtraction analysis` section in the task body, written above `## Plan`. If the answer to the third question is "I don't know," shaping does not proceed until the user nails a band — that band becomes the `scope_budget.net_loc_delta_target` frontmatter (see step 5). The third answer is also the input that decides whether `kind: code-cut` is the right shape (net-negative band → code-cut, see `${COORD_TOOLS:-$HOME/Projects/coord-wright}/docs/task-files-reference.md` § "kind").
+   Record the four answers, in that order, as four numbered or bulleted items under a `### Subtraction analysis` sub-heading inside the plan file passed to `--set-plan=@` (see the plan-file heading rule in step 5). Include the question or a short label with each answer. Derive answers from repository evidence when the user has authorized autonomous shaping; ask only for decisions that cannot be inferred. Do not leave placeholders. The third answer must contain a numeric band such as `+50 to +200`, `0 to 0`, or `-800 to -1200`, also written to `scope_budget.net_loc_delta_target` (see step 5). The third answer is also the input that decides whether `kind: code-cut` is the right shape (net-negative band → code-cut, see `${COORD_TOOLS:-$HOME/Projects/coord-wright}/docs/task-files-reference.md` § "kind").
 
-   **Subtask sizing — be aggressive about narrowness.** A subtask is one agent round, not a feature. Reject your own draft if any of these hold:
+   **Subtask sizing.** A subtask is one agent round at a natural file/module boundary: not a whole feature, and not a single bullet. Reject your own draft if any of these hold:
    - Body has more than one paragraph, more than ~6 lines of prose, or describes more than one local smoke check.
    - Title contains "and" joining two concrete actions ("Implement X and wire Y", "Build component and tests"). Split it.
    - Touches more than ~3 files or more than one directory at a different surface (e.g. backend + frontend + docs in one subtask).
@@ -66,15 +66,15 @@ Workflow:
    - Bundles design/spec work with implementation. A spec is its own subtask or its own dependent task; the coder must not infer the design while building.
    - Bundles refactor + new behavior in one subtask. Land the refactor first, then the new behavior.
 
-   When a draft subtask fails these checks, prefer splitting into a **dependent task chain** rather than stretching to a 6th subtask. 5 chained narrow tasks executes more reliably than one task with 5 fat subtasks, because each task closes independently, accumulates its own findings, and benefits from the review-once-at-end gate. The chain shape (spec → component → integration → wiring → verify) is the natural shape of any non-trivial change; do not collapse it into one runnable task.
+   When a draft subtask fails these checks on genuinely larger work (see the counter-rule below), prefer splitting into a **dependent task chain** rather than stretching to a 6th subtask. 5 chained narrow tasks executes more reliably than one task with 5 fat subtasks, because each task closes independently, accumulates its own findings, and benefits from the review-once-at-end gate. The chain shape (spec → component → integration → wiring → verify) is the natural shape of any non-trivial change; do not collapse it into one runnable task.
 
    **Counter-rule against over-fragmentation.** The above split-into-chain preference applies to *genuinely larger work* — multi-day scope, parallel lanes, or dependency graphs that would block a single worker. It does NOT apply to small features. Per `${COORD_TOOLS:-$HOME/Projects/coord-wright}/docs/agent-workflow-policy.md` § "Two-Agent Loop Bias and Mitigation", rule 4: a feature owned by one person, fitting one PR, completing in under one day belongs in ONE coord task with 2-5 subtasks — not a chain of N tasks. Before splitting into a chain, ask: "would a single developer ship this in one PR?" If yes, it's one task. If the answer is no because of independent surfaces that can ship separately, then a chain is right. Token spend on shape-review across N tasks is real; do not pay it to satisfy a decomposition aesthetic.
 
 3. **Check for duplicates, overlaps, and missing dependencies.**
    - `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" list --search="<key words>" --format=ids`
-   - Also scan recently-completed tasks: `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" list --status=done --limit=10 --format=ids`
+   - Also scan recently-completed tasks in the archive (`coord list` does not read it; done tasks are archived on close): list the newest files in the `archive_dir` from `coord paths --json` (e.g. `ls -t <archive_dir> | head -10`), or use the `coord-archive-index` skill for keyword search.
    - For every active or recent task whose scope overlaps the new task's scope (same files, same surface), explicitly ask the user: "should this depend on `<id>`?" Add via `--depends_on=<id>` if yes.
-   - This is the most-skipped step. Tasks that should chain (audit → spec → rebuild → cleanup) often get created without `depends_on`, breaking the precondition graph and hiding deferred items from the next agent. When in doubt, add the dependency — it's cheap to remove and expensive to retrofit after the fact.
+   - Tasks that should chain (audit → spec → rebuild → cleanup) often get created without `depends_on`, breaking the precondition graph and hiding deferred items from the next agent. When in doubt, add the dependency — it's cheap to remove and expensive to retrofit after the fact.
    - If a related active task exists with the same outcome, surface it instead of creating a duplicate.
 
 4. **Prepare and create the task.**
@@ -97,28 +97,30 @@ Workflow:
        Writes handoff: `.coord/handoffs/<task-id>/S2.md`.
      ```
    - The `<task-id>` placeholder in the Writes/Reads handoff lines is substituted with the actual id after `coord new` returns it. The worker treats these paths as authoritative — no scanning the task file for handoff blocks. Handoff files are committed alongside the subtask's code changes. Every subtask writes a handoff file (no exemption for S1 or the final subtask); only the final subtask omits the `Handoff to S<N+1>` line because there is no next subtask. The `Handoff to S<N+1>` sentence is the shaper's job — only the shaper has the cross-subtask picture, so the worker for S<N> never has to guess what S<N+1> needs.
-   - Subtask sizing per `${COORD_TOOLS:-$HOME/Projects/coord-wright}/docs/agent-workflow-policy.md` § "Two-Agent Loop Bias and Mitigation" rule 4 + 6: prefer 2-4 subtasks each grouping 2-3 related concerns at a natural file/module boundary, NOT 5+ subtasks of one bullet each. The handoff file is the compression layer between cold-start subtask workers.
+   - Subtask sizing per `${COORD_TOOLS:-$HOME/Projects/coord-wright}/docs/agent-workflow-policy.md` § "Two-Agent Loop Bias and Mitigation" rule 4 + 6: prefer 2-5 subtasks each grouping 2-3 related concerns at a natural file/module boundary, not many one-bullet subtasks. The handoff file is the compression layer between cold-start subtask workers.
    - Never write YAML-style subtasks such as `- title: ...`; `coord` rejects them.
    - Write the acceptance criteria to `/tmp/coord-acceptance-<slug>.txt`.
    - Call `coord new` with `--task`, `--complexity`, `--kind`, `--scope`, optional `--assigned`/`--agents`, `--depends_on`, and `--set-subtasks=@/tmp/coord-subtasks-<slug>.txt`.
    - **`kind` selection from the subtraction analysis.** The third grill question (net LOC band) is the input. A net-negative band (e.g. `-500 to -1500`) → `--kind=code-cut`. A net-zero band on existing surfaces → `--kind=refactor`. A net-positive band → `--kind=code-fix` for narrow bug-touching work, or other supported kind. Do not retrofit `code-cut` on legacy tasks; it must be set explicitly when the band is net-negative.
-   - **`code-cut` template injection.** When shaping with `--kind=code-cut`, the task body's `## Non-negotiables` section must contain the verbatim subtraction-discipline block from `${COORD_TOOLS:-$HOME/Projects/coord-wright}/templates/code-cut.md`, with `{target_low}` and `{target_high_added}` substituted from the `scope_budget.net_loc_delta_target` band (see step 5). Write the substituted block into the plan file you pass to `--set-plan=@`, so the worker reads it as part of the plan body. Do not paraphrase or compress — the literal text is the contract.
+   - **`code-cut` template injection.** When shaping with `--kind=code-cut`, the plan must contain the verbatim subtraction-discipline block from `${COORD_TOOLS:-$HOME/Projects/coord-wright}/templates/code-cut.md`, with `{target_low}` and `{target_high_added}` substituted from the `scope_budget.net_loc_delta_target` band (see step 5). Write the substituted block into the plan file you pass to `--set-plan=@`, so the worker reads it as part of the plan body, demoting its `## Non-negotiables` heading to `###` (step 5 heading rule). Do not otherwise paraphrase or compress — the literal text is the contract.
    - Do not add `roles.architect` for normal work. Architecture should already be captured by the shaping interview, subtasks, and `depends_on` chain. Add `roles.reviewer` only when independent review is explicitly required, and add `roles.architect` only when a design handoff must run after queueing.
    - Escalate to Claude+Codex review only when the task changes global workflow, security/auth/trading/money behavior, destructive operations, or more than one repo.
+   - If the title or tags match `money|auth|security|destructive|trading|rca|migration`, `coord-review` requires `complexity` of at least `complex` and `--review_rounds_max=2` or higher (enforced at runtime: a reviewer rejection that reaches the cap parks the task on hold in `needs-brainstorming`; without the field there is no cap).
    - Use batch/multi-agent task chains only for independent lanes. Each lane must have one surface, one output, and one verification path; merge with `review-integrate`.
-   - For unclear scope after grilling, prefer `--brainstorm` over `--shape-override`; brainstorm tasks do not require `--set-subtasks` at creation.
+   - For unclear scope after grilling, use `--brainstorm`; brainstorm tasks do not require `--set-subtasks` at creation.
 
 5. **Fill the remaining shaping fields immediately.**
+   - **Plan-file heading rule.** `--set-plan` replaces only the text under `## Plan`; any `## ` line in the plan file becomes a sibling section, and every later `--set-plan` rerun appends another copy of it (`coord-review` still passes). Start the plan file with prose and use `###` for every sub-heading (`### Subtraction analysis`, `### Non-negotiables — SUBTRACTION DISCIPLINE`, `### Orphan candidates after this cut`, `### Findings for follow-up`). Rerun `--set-plan=@` only with the full plan file.
    - `coord update <id> --set-plan=@<file>` — plan derived from grill answers (for `kind: code-cut`, the plan file must contain the verbatim non-negotiables block from `${COORD_TOOLS:-$HOME/Projects/coord-wright}/templates/code-cut.md` with `{target_low}` and `{target_high_added}` substituted)
    - `coord update <id> --set-acceptance-test=@<file>` — final verification path
-   - `coord update <id> --acceptance="bullet1,bullet2"` — populate frontmatter `acceptance:` list (the handoff renderer needs this; body-only acceptance passes `coord-review` but produces a hollow handoff card)
-   - `coord update <id> --verify-commands="cmd1,cmd2"` — machine-runnable verification commands
+   - `coord update <id> --acceptance=@/tmp/coord-acceptance-<slug>.txt` (one item per line; a single-line value is split on commas) — populate frontmatter `acceptance:` list (the handoff renderer needs this; body-only acceptance passes `coord-review` but produces a hollow handoff card)
+   - `coord update <id> --verify-commands=@<file>` (one command per line, so commas inside a command survive) — machine-runnable verification commands. The worker re-runs them after any closing round; each must exit 0 and leave the worktree unchanged, or the task is demoted to `review-failed`.
    - `coord update <id> --scope="path1,path2"` — populate frontmatter `scope:` (NEVER pass shell brace-expansion like `{a,b}/`; coord parses comma-separated lists, not shell globs at the shell)
    - `coord update <id> --scope-creates="path1,path2"` — subset of `scope:` entries that this task creates; exempts them from preflight existence checks
    - `coord update <id> --depends_on=<csv>` if any dependencies surfaced
-   - `coord update <id> --scope-budget-loc="<band>"` — write the net LOC delta band from the third grill question (e.g. `'-800 to -1200'` for a cut, `'+50 to +200'` for a feature). The CLI defaults `abort_if_exceeded_by_pct=50`; override with `--scope-budget-abort-pct=<n>` when the budget needs a tighter or looser fuse. Required for `kind: code-cut`; recommended for every shaped task. See `${COORD_TOOLS:-$HOME/Projects/coord-wright}/docs/task-files-reference.md` § `scope_budget`.
+   - `coord update <id> --scope-budget-loc="<band>"` — write the net LOC delta band from the third grill question (e.g. `'-800 to -1200'` for a cut, `'+50 to +200'` for a feature). The CLI defaults `abort_if_exceeded_by_pct=50`; override with `--scope-budget-abort-pct=<n>` when the budget needs a tighter or looser fuse. Required by `coord-review` for every shaped task, including `0 to 0` for work with no file growth. See `${COORD_TOOLS:-$HOME/Projects/coord-wright}/docs/task-files-reference.md` § `scope_budget`.
 
-   The shaped task body must also include an empty `## Findings for follow-up` section at the bottom (write it into the plan file before `--set-plan`). This gives the coder a clear destination for cuts/issues spotted in flight, preserving the "do not fix it, write it down" half of the subtraction-discipline non-negotiables. Cheap to add at shape time; preserves the discipline at run time.
+   The shaped task must also include an empty `### Findings for follow-up` sub-heading at the end of the plan file passed to `--set-plan`. This gives the coder a clear destination for cuts/issues spotted in flight, preserving the "do not fix it, write it down" half of the subtraction-discipline non-negotiables. Cheap to add at shape time; preserves the discipline at run time.
 
 6. **Scan for orphan candidates (when the task deletes or shrinks existing surfaces).**
 
@@ -141,7 +143,7 @@ Workflow:
    rg --no-heading "<symbol-or-route>" -l | grep -v -E '(test|spec|__mocks__|fixtures)'
    ```
 
-   Anything with **zero non-test callers** after the planned cut becomes an orphan candidate. Write them into a new `## Orphan candidates after this cut` section in the task body (via `coord update --set-plan=@` or by extending the plan file before its first write).
+   Anything with **zero non-test callers** after the planned cut becomes an orphan candidate. Write them under a `### Orphan candidates after this cut` sub-heading in the plan file, then rerun `coord update --set-plan=@` with the full file.
 
    For each orphan candidate, the shaper picks one of three resolutions and records it inline:
 
@@ -149,7 +151,7 @@ Workflow:
    - **Split into a follow-up code-cut task** chained via `--depends_on`. Best when the orphan is on a different surface or large enough to justify its own scope/budget.
    - **Leave with rationale** ("orphan retained because: <reason>"). Best when the surface is intentionally preserved (public API, scheduled for a later cut, etc.). Record the reason — silent leaves are forbidden.
 
-   This step is what would have prevented a real C1↔C3 collision (C1 absorbed C3's scope because the build forced it). With orphan-candidates visible at shape time, the shaper either merges deliberately or splits precisely; the "build forced it" outcome should not recur.
+   With orphan-candidates visible at shape time, the shaper either merges scope deliberately or splits precisely, instead of one subtask silently absorbing another's scope during the build.
 
 7. **Run coord-review (mechanical preflight).**
    - Invoke the `coord-review` skill with the task id.
@@ -169,9 +171,8 @@ Workflow:
 
 10. **Show the user.**
    - Run `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" next-subtask <id>` and confirm it returns `S1`. If it does not, fix the subtask block before reporting the task.
-   - `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" show <id> --handoff` and report the id.
+   - `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" show <id> --compact` and report the id.
 
 Notes:
 - Source of truth for task shape: `${COORD_TOOLS:-$HOME/Projects/coord-wright}/docs/task-files.md`.
-- Do not bypass shaping with `--shape-override` unless the user explicitly approves a recorded reason.
 - For trivial code fixes the user wants done now, skip this skill and do the work inline, or create a narrow fully shaped Codex task only when the user explicitly wants it queued.

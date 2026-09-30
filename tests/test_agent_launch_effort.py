@@ -1,7 +1,8 @@
 """Regression tests for the interactive-effort default in bin/agent-launch.sh.
 
 The VS Code task buttons launch a bare `agent-launch.sh claude` (no -p), which
-should get `--effort max` by default. Headless coord callers (worker.sh,
+gets no `--effort` unless CLAUDE_LAUNCH_EFFORT opts in, so settings.json owns
+interactive effort. Headless coord callers (worker.sh,
 watchdog.sh) pass -p and must be left untouched so each task honours its own
 reasoning_effort. Codex launches are never affected.
 """
@@ -51,9 +52,9 @@ def _effort_value(argv):
     return argv[argv.index("--effort") + 1]
 
 
-def test_interactive_claude_defaults_to_max(tmp_path):
+def test_interactive_claude_has_no_default_effort(tmp_path):
     argv, _ = _run(["claude"], tmp_path=tmp_path)
-    assert _effort_value(argv) == "max"
+    assert "--effort" not in argv
 
 
 def test_headless_print_launch_is_untouched(tmp_path):
@@ -91,7 +92,7 @@ def test_empty_env_disables_default(tmp_path):
 
 def test_explicit_effort_flag_is_respected(tmp_path):
     argv, _ = _run(["claude", "--effort", "low"], tmp_path=tmp_path)
-    # Not doubled, not overridden to max.
+    # Not doubled, not overridden.
     assert argv.count("--effort") == 1
     assert _effort_value(argv) == "low"
 

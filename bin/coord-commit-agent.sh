@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 
 coord_commit_ts() {
-  TZ=Europe/Dublin date +%FT%T%z
+  if [[ -n "${COORD_TZ:-}" ]]; then
+    TZ="$COORD_TZ" date +%FT%T%z
+  else
+    date +%FT%T%z
+  fi
 }
 
 coord_commit_log() {
@@ -72,7 +76,10 @@ coord_commit_scope_specs() {
     return 0
   fi
   local spec
-  printf 'tasks\n.coord\n'
+  # Configured task paths (COORD_TASKS_DIR etc. or .coord/config.env).
+  # A failing coord must not empty the spec list (that would stage everything).
+  { python3 "$(dirname "${BASH_SOURCE[0]}")/coord" paths | cut -f2; } || printf 'tasks\n'
+  printf '.coord\n'
   while IFS= read -r spec; do
     if [[ -z "$spec" ]]; then
       continue
@@ -92,25 +99,29 @@ coord_commit_stage_changes() {
   # historical stage-everything behavior.
   local spec
   local specs=()
-  local matched=()
+  COORD_COMMIT_MATCHED_SPECS=()
+  COORD_COMMIT_HAS_SCOPE=0
   while IFS= read -r spec; do
     if [[ -n "$spec" ]]; then
       specs+=("$spec")
     fi
   done < <(coord_commit_scope_specs)
   if (( ${#specs[@]} == 0 )); then
-    git add -A
+    git reset -q || return 1
+    git add -A || return 1
     return 0
   fi
+  COORD_COMMIT_HAS_SCOPE=1
+  git reset -q || return 1
   for spec in "${specs[@]}"; do
     # git add errors on pathspecs that match nothing; only pass specs with
     # pending changes.
     if [[ -n $(git status --porcelain --untracked-files=all -- "$spec" 2>/dev/null) ]]; then
-      matched+=("$spec")
+      COORD_COMMIT_MATCHED_SPECS+=("$spec")
     fi
   done
-  if (( ${#matched[@]} > 0 )); then
-    git add -A -- "${matched[@]}"
+  if (( ${#COORD_COMMIT_MATCHED_SPECS[@]} > 0 )); then
+    git add -A -- "${COORD_COMMIT_MATCHED_SPECS[@]}" || return 1
   fi
 }
 
@@ -148,13 +159,17 @@ commit_agent_changes() {
     return 1
   fi
 
-  coord_commit_stage_changes
+  coord_commit_stage_changes || return 1
   if git diff --cached --quiet; then
     coord_commit_warn_leftovers
     return 0
   fi
-  git commit --quiet -m "coord: work $COORD_TASK_ID"
-  push_current_branch
+  if (( COORD_COMMIT_HAS_SCOPE )); then
+    git commit --quiet -m "coord: work $COORD_TASK_ID" -- "${COORD_COMMIT_MATCHED_SPECS[@]}" || return 1
+  else
+    git commit --quiet -m "coord: work $COORD_TASK_ID" || return 1
+  fi
+  push_current_branch || return 1
   coord_commit_log "git commit pushed for $COORD_TASK_ID"
   coord_commit_warn_leftovers
 }
@@ -180,14 +195,18 @@ commit_tentative_changes() {
     return 1
   fi
 
-  coord_commit_stage_changes
+  coord_commit_stage_changes || { echo 0; return 1; }
   if git diff --cached --quiet; then
     coord_commit_warn_leftovers
     return 0
   fi
 
-  coord_commit_run_logged git commit --quiet -m "coord: tentative $COORD_TASK_ID (rc=$rc, needs human review)"
-  push_current_branch
+  if (( COORD_COMMIT_HAS_SCOPE )); then
+    coord_commit_run_logged git commit --quiet -m "coord: tentative $COORD_TASK_ID (rc=$rc, needs human review)" -- "${COORD_COMMIT_MATCHED_SPECS[@]}" || { echo 0; return 1; }
+  else
+    coord_commit_run_logged git commit --quiet -m "coord: tentative $COORD_TASK_ID (rc=$rc, needs human review)" || { echo 0; return 1; }
+  fi
+  push_current_branch || { echo 0; return 1; }
   coord_commit_log "tentative commit pushed for $COORD_TASK_ID"
   coord_commit_warn_leftovers
   echo 1

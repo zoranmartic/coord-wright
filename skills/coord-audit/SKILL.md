@@ -3,7 +3,7 @@ name: coord-audit
 description: Run the CoordWright hardening audit — read-only check of codex sandbox config, auth file perms, worker.sh integrity, execpolicy allow-list, Claude Code hook installation, and per-project .gitignore + .env perms. Use when the user says "/coord-audit", "audit hardening", "check security posture", or wants a one-shot drift check.
 ---
 
-Read-only inspection of the operational hardening landed across the CoordWright checkout, ~/.codex/, ~/.claude/, and each registered project. Does not modify anything. The same script can run nightly under launchd (e.g. `com.coord.audit.daily`, logging to `~/Library/Logs/coord-audit.log`); this skill exposes the same check on demand.
+Read-only inspection of the operational hardening landed across the CoordWright checkout, ~/.codex/, ~/.claude/, and each registered project. Does not modify anything. This skill runs the check on demand. `install.sh` does not install a scheduled audit; a machine may have an optional, manually installed LaunchAgent (for example `com.coord.audit.daily` logging to `~/Library/Logs/coord-audit.log`), but do not assume one exists.
 
 Source of truth:
 
@@ -33,12 +33,12 @@ Source of truth:
    - If the secrets sweep is run, present its output AFTER the hardening audit so a FAIL is not buried under advisory noise.
 
 4. **Cross-reference for context.**
-   - Mention that the same hardening audit runs nightly (`launchctl list | grep com.coord.audit.daily`) and logs to `~/Library/Logs/coord-audit.log` so the user can spot drift between manual runs.
+   - Only if `launchctl list | grep com.coord.audit.daily` shows a manually installed nightly job, point the user at its log (`~/Library/Logs/coord-audit.log`) for drift between manual runs. Otherwise say nothing about scheduled audits; `install.sh` does not install one.
    - If any FAIL is in scope, point at the relevant project docs or memory for context (e.g. the project's `AGENTS.md`, or a relevant note under `~/.claude/projects/<project>/memory/`).
 
 ## Rules
 
 - Never mutate any file from this skill. For chmod fixes or sandbox changes, the user makes the call explicitly.
-- Truncate per-script output over 60 lines to the first 30 + last 30 lines with `[... N lines truncated ...]`.
+- If output is long, show the head and tail with a `[... N lines truncated ...]` marker and always keep FAIL/WARN lines.
 - Report results plainly; do not fabricate check names. The script defines what is checked.
 - If `audit-hardening.sh` is missing at the expected path, print that the CoordWright install needs to be re-run (`bash "${COORD_TOOLS:-$HOME/Projects/coord-wright}/install.sh"`) and stop.

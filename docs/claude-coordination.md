@@ -35,7 +35,7 @@ Resolution order is `reasoning_effort_architect` or `reasoning_effort_review` fo
 1. Optionally run `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" precheck` from the project root for a cheap "is there Claude work?" answer.
 2. Resolve one `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" pickup --assigned=claude` packet, or start from the wrapper-resolved handoff packet when the trigger already provided it.
 3. Use the embedded handoff packet or `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" show <id> --handoff` as the default read path.
-4. If that view is insufficient, escalate to `--compact`, then `show-signatures`, then targeted file or section reads. Use full `show` only when a specific missing detail still blocks the work.
+4. If that view is insufficient, escalate to `--compact`, then targeted file or section reads. Use full `show` only when a specific missing detail still blocks the work.
 5. Do the work in the project repo.
 6. Write findings back with `update`.
 7. Hand off to Codex with `--status=pending --assigned=codex`, or mark `done` when appropriate.
@@ -58,8 +58,8 @@ When Claude creates or reshapes tasks, task architecture is the first job. Do no
 - Keep findings compact after discovery: changed files, verification result, blockers, and handoff notes. Avoid repeating large inventories in every round.
 - Reserve `verify_commands` for the final acceptance gate. Put interim smoke checks in the active subtask body or the current round finding.
 - If token telemetry shows high cache/input or repeated oversized effective context, finish the current narrow step and create a follow-on task with a compact handoff instead of continuing to extend the same task.
-- Shaping warnings from `coord new` or `coord update --set-subtasks` are fatal for runnable tasks by default. Use `--brainstorm` for unclear work, and use `--shape-override=<reason>` only for a human-approved exception.
-- Do not stop after creating `status: shaping` task files. A shaped task must be handoff-ready in `show --handoff`: actionable current focus, concrete Plan, concrete Acceptance test, parseable subtasks with model/complexity metadata, correct dependencies, and only intentional warnings.
+- Shaping warnings from `coord new` or `coord update --set-subtasks` are fatal for runnable tasks by default. Use `--brainstorm` for unclear work; there is no bypass flag.
+- Do not stop after creating `status: shaping` task files. A shaped task must pass `coord promote` validation and `coord-review` (read it with `show <id>`; `show --handoff` omits Plan and subtasks): concrete Plan, concrete Acceptance test, parseable subtasks with model/complexity metadata, correct dependencies, and only intentional warnings.
 - Add explicit `roles.reviewer` when independent review is required. Add
   explicit `roles.architect` only when a design handoff must run after
   queueing; the architect round must persist executable subtasks with
@@ -85,8 +85,8 @@ Claude-first tasks are not sensitive to this race — Claude won't start until `
 Claude no longer has a separate project trigger script or per-agent sentinel path. The normal path is the shared per-project launchd worker:
 
 1. The project launchd job starts `worker/worker.sh <project>` at load and on each `StartInterval` tick. The shared template uses a 60 second interval.
-2. The worker exits before pickup when `.coord/sleep-until` exists and still points to a future timestamp. When the timestamp has expired, it removes the marker and continues.
-3. The worker synchronizes a clean checkout, then runs `python3 "$COORD_TOOLS/bin/coord" pickup --assigned=claude`. If no Claude-runnable task exists, the same tick tries `pickup --assigned=codex`.
+2. The worker removes expired provider cooldown markers and exits before pickup only when both `.coord/sleep-until.claude` and `.coord/sleep-until.codex` are active.
+3. The worker synchronizes a clean checkout, then runs `python3 "$COORD_TOOLS/bin/coord" pickup --assigned=claude` unless Claude is cooling down. If no Claude-runnable task exists, or Claude is cooling down, the same tick tries `pickup --assigned=codex` unless Codex is cooling down.
 4. A run starts only when pickup returns `decision=run`; the pickup packet is the authoritative task id, round role, resolved model, and resolved reasoning source.
 5. Before launching Claude, the worker records `.coord/worker.state` and acquires the shared global semaphore through `worker/semaphore.sh`, so concurrent project ticks do not overrun the configured slot limit.
 6. Claude is launched through `bin/agent-launch.sh claude` with `/coord-run <id>`. On success, the worker commits and pushes worktree changes as `coord: work <id>` before recording wrapper token usage on the task. When the task declares `scope:`/`scope_creates:` globs, only those paths plus `tasks/` and `.coord/` are staged; anything else dirty (for example a concurrent edit by another actor) is left uncommitted with an `out-of-scope changes left uncommitted` warning in `worker.log`. Tasks without scope keep the historical stage-everything behavior.
@@ -102,11 +102,11 @@ The shared concept and generic regex override are documented in `coordination.md
 
 Precedence is Claude-specific override -> generic override -> built-in default.
 
-When `worker/rate-limit.sh` matches a rate-limit signature in the Claude output artifact, it writes the parsed reset time to `.coord/sleep-until`. If Claude already marked the task `claude-working`, the worker restores the pre-pickup runnable status and assignee before exiting. Subsequent `worker/worker.sh` ticks short-circuit while that timestamp is in the future and delete the marker after it expires; normal pickup resumes on the next tick. The current wrapper does **not** escalate rate-limited Claude tasks to `needs-brainstorming` and does **not** write a per-task rate-limit flag — `.coord/sleep-until` is the only persistent rate-limit state.
+When `worker/rate-limit.sh` matches a rate-limit signature in the Claude output artifact, it writes the parsed reset time to `.coord/sleep-until.claude`. If Claude already marked the task `claude-working`, the worker restores the pre-pickup runnable status and original assignee, then commits and pushes scoped tentative edits before exiting. Subsequent ticks skip Claude until the timestamp expires but may run already-assigned Codex work. Out-of-scope dirt remains fail-closed. The wrapper does **not** reassign roles, escalate a rate-limited Claude task to `needs-brainstorming`, or write a per-task rate-limit flag.
 
 ## Output noise reduction (Claude-side)
 
-The shared 20+20 truncation policy is documented in `coordination.md`. When Claude runs shell commands, build steps, or tests during an interactive session, apply the same 20+20 rule manually before pasting output into a finding. The `truncateOutput` helper in `coord` is the canonical implementation; this is the live-tool fallback for output that does not pass through `coord`.
+The shared 20+20 truncation policy is documented in `coordination.md`. When Claude runs shell commands, build steps, or tests during an interactive session, apply the same 20+20 rule manually before pasting output into a finding. `coord` itself does not truncate output.
 
 ## Micro-loop review inside a coord task: `/codex-loop`
 
@@ -118,7 +118,7 @@ Use explicit role flow for the task itself when needed; use the micro loop to ha
 
 ## Recovery from agent failures
 
-When an agent run fails (max-turns hit, rc!=0, syntax error in worker.sh edited mid-tick), the worker's "restore original status" logic must NOT blindly restore the pre-pickup status. An agent may complete its handoff (e.g. `coord update --status review-failed` which aliases to `pending + reassign-to-codex`) and then hit max-turns on the closing log message. Restoring `ORIG_STATUS=pending, ORIG_ASSIGNED=claude` would clobber the completed handoff.
+When an agent run fails (max-turns hit, rc!=0, syntax error in worker.sh edited mid-tick), the worker's "restore original status" logic must NOT blindly restore the pre-pickup status. An agent may complete its handoff (e.g. `coord update --status review-failed` which aliases to `pending` reassigned to `roles.coder`, else the other agent) and then hit max-turns on the closing log message. Restoring `ORIG_STATUS=pending, ORIG_ASSIGNED=claude` would clobber the completed handoff.
 
 Recipe:
 
@@ -131,9 +131,9 @@ Recipe:
 
 When a launchd coord worker logs `git sync skipped: worktree dirty before pickup` every minute, it has two distinct root causes that look identical from the log line alone.
 
-**Cause 1 — `.gitignore` missing a coord runtime rule.** The worker writes `.coord/worker.lock` and `.coord/worker.state` before the dirty check (see `worker/worker.sh` step ordering). If `.gitignore` doesn't ignore `.coord/worker.state` (for example through `.coord/` or `.coord/*`), `worker.state` shows as untracked → worker exits as "dirty" → never picks up tasks. Diagnose with `git check-ignore -v .coord/worker.state`. Fix: add `.coord/` or re-run `~/Projects/coord-wright/install.sh` for a registered project.
+**Cause 1 — `.gitignore` missing a coord runtime rule.** The worker writes `.coord/worker.lock` and `.coord/worker.state` before the dirty check (see `worker/worker.sh` step ordering). If `.gitignore` doesn't ignore `.coord/worker.state` (for example through `.coord/` or `.coord/*`), `worker.state` shows as untracked → worker exits as "dirty" → never picks up tasks. Diagnose with `git check-ignore -v .coord/worker.state`. Fix: add the pair `.coord/*` and `!.coord/handoffs/` (keeps handoff files tracked) or re-run `~/Projects/coord-wright/install.sh` for a registered project.
 
-**Cause 2 — `worker.sh` edited mid-tick.** If a separate coord task commits a new `worker/worker.sh` while another project's worker is mid-execution (codex/Claude tick can run 20+ min), the running bash re-reads the mutated file and bombs at runtime with `syntax error near unexpected token`. The crash exits before `commit_agent_changes`, so any agent code edits stay dirty. Critically, if the agent had already called `coord update --complete-subtask=Sn` before the crash, the task file is committed (advancing `current_subtask`) but the code edits aren't — task state and code desync. Recovery: `git add` the dirty files and `git commit -m "coord: recover S<n> ..."` — do NOT `git restore`, because the task file already says S<n> is done.
+**Cause 2 — `worker.sh` edited mid-tick.** Now mitigated: the worker re-execs from an immutable tmp copy, so this applies only to older workers or other crashes. If a separate coord task commits a new `worker/worker.sh` while another project's worker is mid-execution (codex/Claude tick can run 20+ min), the running bash re-reads the mutated file and bombs at runtime with `syntax error near unexpected token`. The crash exits before `commit_agent_changes`, so any agent code edits stay dirty. Critically, if the agent had already called `coord update --complete-subtask=Sn` before the crash, the task file is committed (advancing `current_subtask`) but the code edits aren't — task state and code desync. Recovery: `git add` the dirty files and `git commit -m "coord: recover S<n> ..."` — do NOT `git restore`, because the task file already says S<n> is done.
 
 Diagnosis order: run `git check-ignore -v .coord/worker.state` first (cheap). If ignored properly, scan the log for `syntax error|tick failed|rc=` to find a crash. `tail -30 worker.log` not just the latest dirty line.
 

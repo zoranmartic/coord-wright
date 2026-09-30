@@ -13,18 +13,17 @@ Project-root preflight:
 
 ## Syntax
 
-`/coord-tokens [--since=<duration>]`
+`/coord-tokens`
 
 ## Workflow
 
 1. **Run the helpers.**
    - Claude side: `bash "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord-tokens.sh"`
-   - Codex side: `node "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/codex-coord-stats.js"`
-   - Pass `--since=<duration>` through to whichever helper accepts it; if neither does, print the duration in the header and run them unfiltered.
+   - Codex side: `bash "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord-tokens.sh" --agent=codex`
    - If a helper exits non-zero, print its stderr and continue with whatever output is available — partial data is still useful.
 
 2. **Present output.**
-   - Print a short header: `Token spend (Claude / Codex)` plus the `--since` value when supplied.
+   - Print a short header: `Token spend (Claude / Codex)`.
    - Stream each helper's output with a one-line label per section.
    - Do not summarise, do not interpret — show the raw output so the user sees what the helpers actually report.
 

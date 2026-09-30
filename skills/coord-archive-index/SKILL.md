@@ -10,7 +10,7 @@ Use this skill to summarize task archives from canonical project roots. Avoid co
 ## Workflow
 
 1. Resolve canonical project roots from `${COORD_TOOLS:-$HOME/Projects/coord-wright}/projects.txt`.
-2. For one project, run `scripts/build_coord_archive_index.py --project-root <root> --output <path>`.
+2. For one project, run `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/skills/coord-archive-index/scripts/build_coord_archive_index.py" --project-root <root> --output <path>` (`--output` is required; `--format json|tsv` is optional).
 3. Prefer generated JSON for tooling and TSV for quick shell inspection.
 4. Keep generated artifacts out of the repo unless the user explicitly wants them tracked.
 5. Use the index to find candidate tasks, then open only the specific task files needed.

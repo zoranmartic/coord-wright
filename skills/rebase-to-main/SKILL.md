@@ -26,8 +26,13 @@ Resolve:
 4. `git add <resolved-path>` for each resolved file.
 5. `git rebase --continue`.
 6. Repeat if more conflicts remain.
-7. Re-run this skill after a successful continue — it will run `diff --check`
-   and force-push.
+7. After a successful continue, do NOT re-run this skill: its preflight
+   requires HEAD to equal the upstream, which a rebased branch no longer does
+   (exit 2). Run the two finish commands the script printed under
+   "Then finish by hand":
+   `git diff --check origin/main..HEAD`, then
+   `git push --force-with-lease=<upstream-branch>:<pre-rebase-sha> origin HEAD:<upstream-branch>`
+   (the lease is pinned to the upstream commit the script fetched).
 
 To abandon a conflicted rebase: `git rebase --abort`, confirm `git status --short`
 is clean, then re-run this skill from scratch.

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Per-project coord worker. Runs every 60s under launchd. Picks the first
-# pending task in the project and runs the assigned agent; handles rate-limit sleep.
+# pending task in the project and runs the assigned agent; handles per-agent
+# rate-limit cooldowns.
 #
 # Usage: worker.sh <project-abs-path>
 
@@ -8,12 +9,6 @@ set -euo pipefail
 
 # launchd does not inherit the user PATH; add common Claude install locations.
 export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
-
-# Force Dublin time in child processes (codex's Rust router logs with a
-# Z-suffix UTC timestamp by default; this makes the codex log lines align
-# with our bracketed Dublin timestamps so the worker.log timeline is
-# readable in one timezone).
-export TZ=Europe/Dublin
 
 mktemp_suffix() {
   local prefix="$1" suffix="$2" path
@@ -32,10 +27,11 @@ fi
 # Wrap a command in a wall-clock timeout when TIMEOUT_CMD and ROUND_TIMEOUT_SECONDS are set.
 # Falls back to a Python process-group watchdog when GNU timeout is unavailable.
 run_with_timeout() {
-  if [[ -z "${ROUND_TIMEOUT_SECONDS:-}" ]]; then
-    "$@"
-  elif [[ -n "${TIMEOUT_CMD:-}" ]]; then
-    "$TIMEOUT_CMD" --kill-after=30 "$ROUND_TIMEOUT_SECONDS" "$@"
+  local rc=0
+  ACTIVE_TIMEOUT_GROUP=0
+  if [[ -n "${ROUND_TIMEOUT_SECONDS:-}" && -n "${TIMEOUT_CMD:-}" ]]; then
+    ACTIVE_TIMEOUT_GROUP=1
+    "$TIMEOUT_CMD" --kill-after=30 "$ROUND_TIMEOUT_SECONDS" "$@" <&0 &
   else
     python3 -c '
 import os
@@ -48,34 +44,81 @@ try:
 except Exception:
     timeout = 0
 cmd = sys.argv[2:]
-if timeout <= 0 or not cmd:
+if not cmd:
     sys.exit(127)
 
 grace = int(os.environ.get("ROUND_TIMEOUT_GRACE_SECONDS", "30") or "30")
 proc = subprocess.Popen(cmd, preexec_fn=os.setsid)
-try:
-    rc = proc.wait(timeout=timeout)
-except subprocess.TimeoutExpired:
+
+
+def stop_group(exit_code, wait_seconds=grace):
+    # An external signal to this wrapper (not only a round timeout) must take
+    # the agent process group down with it; otherwise an orphaned agent keeps
+    # editing the checkout after the worker has recorded the round as failed.
     try:
         os.killpg(proc.pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
     try:
-        proc.wait(timeout=grace)
-        sys.exit(124)
+        proc.wait(timeout=wait_seconds)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        proc.wait()
-        sys.exit(137)
+        if exit_code == 124:
+            exit_code = 137
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    proc.wait()
+    sys.exit(exit_code)
+
+
+def forward_signal(signum, _frame):
+    stop_group(128 + signum, min(grace, 3))
+
+
+signal.signal(signal.SIGTERM, forward_signal)
+signal.signal(signal.SIGINT, forward_signal)
+signal.signal(signal.SIGHUP, forward_signal)
+try:
+    rc = proc.wait(timeout=timeout if timeout > 0 else None)
+except subprocess.TimeoutExpired:
+    stop_group(124)
 
 if rc < 0:
     sys.exit(128 + abs(rc))
 sys.exit(rc)
-' "$ROUND_TIMEOUT_SECONDS" "$@"
+' "${ROUND_TIMEOUT_SECONDS:-0}" "$@" <&0 &
   fi
+  ACTIVE_TIMEOUT_PID=$!
+  wait "$ACTIVE_TIMEOUT_PID" || rc=$?
+  ACTIVE_TIMEOUT_PID=""
+  return "$rc"
+}
+
+terminate_round() {
+  local signum="$1" attempts=0
+  trap '' TERM INT HUP
+  if [[ -n "${ACTIVE_TIMEOUT_PID:-}" ]]; then
+    kill -TERM "$ACTIVE_TIMEOUT_PID" 2>/dev/null || true
+    if [[ "${ACTIVE_TIMEOUT_GROUP:-0}" == "1" ]]; then
+      kill -TERM -- "-$ACTIVE_TIMEOUT_PID" 2>/dev/null || true
+    fi
+    while (( attempts < 50 )); do
+      if ! kill -0 "$ACTIVE_TIMEOUT_PID" 2>/dev/null; then
+        if [[ "${ACTIVE_TIMEOUT_GROUP:-0}" != "1" ]] || ! kill -0 -- "-$ACTIVE_TIMEOUT_PID" 2>/dev/null; then
+          break
+        fi
+      fi
+      sleep 0.1
+      attempts=$((attempts + 1))
+    done
+    if [[ "${ACTIVE_TIMEOUT_GROUP:-0}" == "1" ]]; then
+      kill -KILL -- "-$ACTIVE_TIMEOUT_PID" 2>/dev/null || true
+    fi
+    kill -KILL "$ACTIVE_TIMEOUT_PID" 2>/dev/null || true
+    wait "$ACTIVE_TIMEOUT_PID" 2>/dev/null || true
+  fi
+  exit "$((128 + signum))"
 }
 
 annotate_round_timeout_artifact() {
@@ -136,7 +179,7 @@ mkdir -p .coord
 
 LOG=.coord/worker.log
 STATE=.coord/worker.state
-ts() { TZ=Europe/Dublin date +%FT%T%z; }
+ts() { date +%FT%T%z; }
 
 load_project_config_env() {
   local cfg=".coord/config.env" raw key val
@@ -164,6 +207,13 @@ load_project_config_env() {
 }
 
 load_project_config_env
+
+# COORD_TZ (IANA name, e.g. America/New_York) pins the timezone of worker
+# timestamps and of child processes (agent CLIs, rate-limit reset parsing), so
+# the worker.log timeline reads in one zone. Unset: the system local timezone.
+if [[ -n "${COORD_TZ:-}" ]]; then
+  export TZ="$COORD_TZ"
+fi
 
 # Unattended autonomy gate. Worker rounds run Claude with
 # --dangerously-skip-permissions and Codex with danger-full-access — those
@@ -298,6 +348,56 @@ restore_rate_limited_task() {
   esac
 }
 
+rate_limit_marker_active() {
+  local agent="$1" marker=".coord/sleep-until.$1" until now
+  [[ -f "$marker" ]] || return 1
+  until=$(cat "$marker" 2>/dev/null || true)
+  now=$(date +%s)
+  if [[ "$until" =~ ^[0-9]+$ ]] && (( now < until )); then
+    return 0
+  fi
+  rm -f "$marker"
+  return 1
+}
+
+all_agents_rate_limited() {
+  local claude_limited=0 codex_limited=0
+  rate_limit_marker_active claude && claude_limited=1
+  rate_limit_marker_active codex && codex_limited=1
+  (( claude_limited == 1 && codex_limited == 1 ))
+}
+
+pickup_id_from_json() {
+  python3 - "$1" <<'PYEOF'
+import json, sys
+try:
+    payload = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+if payload.get("decision") == "run":
+    print(payload.get("pickup", {}).get("id") or payload.get("task", {}).get("id") or "")
+PYEOF
+}
+
+select_runnable_task() {
+  local candidate
+  AGENT=""
+  PICKUP=""
+  ID=""
+  for candidate in claude codex; do
+    if rate_limit_marker_active "$candidate"; then
+      continue
+    fi
+    PICKUP=$(python3 "$TOOLS/bin/coord" pickup --assigned="$candidate" 2>> "$LOG" || true)
+    ID=$(pickup_id_from_json "$PICKUP")
+    if [[ -n "$ID" ]]; then
+      AGENT="$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 codex_doctor_snapshot() {
   local reason="${1:-failure}" task_id="${2:-unknown}" project_name safe_task base path err rc
   project_name=$(basename "$PROJ" | LC_ALL=C tr -c '[:alnum:]._-' '_')
@@ -324,6 +424,72 @@ codex_doctor_snapshot() {
 }
 
 source "$TOOLS/bin/coord-commit-agent.sh"
+
+recover_interrupted_task_bookkeeping() {
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local tasks_dir="${COORD_TASKS_DIR:-tasks}"
+  local repo_root dirty_paths path quoted recovered_files
+  local dirty_count=0 recovered_count=0 task_tree_only=1
+  repo_root=$(git rev-parse --show-toplevel)
+  case "$tasks_dir" in
+    "$repo_root"/*) tasks_dir=${tasks_dir#"$repo_root"/} ;;
+    /*) return 0 ;;
+  esac
+  tasks_dir=${tasks_dir#./}
+  tasks_dir=${tasks_dir%/}
+  case "$tasks_dir" in
+    ""|"."|".."|../*|*/../*|*/..) return 0 ;;
+  esac
+
+  dirty_paths=$(mktemp -t coord-task-bookkeeping)
+  {
+    git diff --name-only -z --
+    git diff --cached --name-only -z --
+    git ls-files --others --exclude-standard -z --
+  } > "$dirty_paths"
+
+  while IFS= read -r -d '' path || [[ -n "$path" ]]; do
+    (( dirty_count += 1 ))
+    case "$path" in
+      "$tasks_dir"/*) ;;
+      *) task_tree_only=0 ;;
+    esac
+  done < "$dirty_paths"
+  if (( dirty_count == 0 || task_tree_only == 0 )); then
+    rm -f "$dirty_paths"
+    return 0
+  fi
+
+  local git_dir
+  git_dir=$(git rev-parse --git-dir)
+  if [[ -e "$git_dir/rebase-merge" || -e "$git_dir/rebase-apply" || -e "$git_dir/MERGE_HEAD" ]]; then
+    rm -f "$dirty_paths"
+    echo "[$(ts)] tick-start task bookkeeping recovery skipped: git operation in progress" >> "$LOG"
+    return 1
+  fi
+
+  git add -A -- "$tasks_dir"
+  git diff --cached --name-only -z -- > "$dirty_paths"
+  while IFS= read -r -d '' path || [[ -n "$path" ]]; do
+    (( recovered_count += 1 ))
+    printf -v quoted '%q' "$path"
+    recovered_files="${recovered_files:+$recovered_files, }$quoted"
+  done < "$dirty_paths"
+  rm -f "$dirty_paths"
+
+  if ! git commit -m "coord: recover interrupted task bookkeeping ($recovered_count file(s))" >> "$LOG" 2>&1; then
+    echo "[$(ts)] tick-start task bookkeeping recovery commit failed" >> "$LOG"
+    return 0
+  fi
+  echo "[$(ts)] tick-start task bookkeeping recovery: committed $recovered_files" >> "$LOG"
+  if ! push_current_branch; then
+    echo "[$(ts)] tick-start task bookkeeping recovery: push failed; stopping tick" >> "$LOG"
+    return 1
+  fi
+}
 
 sync_clean_checkout() {
   if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -385,9 +551,9 @@ if not blocks:
 approve = re.compile(r"\bAPPROVE\b|Outcome:.*APPROVE", re.I)
 reject_line = re.compile(r"\bREJECT\b|review-failed", re.I)
 # The demote trigger is stricter than the approve suppressor: only an explicit
-# verdict line counts — "Outcome: ... REJECT", the documented reviewer format
-# "REJECT: <reason>" (agents/reviewer.md), "REJECT.", or a standalone REJECT —
-# so prose like "prior REJECTs are resolved" cannot false-trip the guard.
+# verdict line counts — "Outcome: ... REJECT" (the reviewer-round format in
+# skills/coord-check/SKILL.md), "REJECT: <reason>", "REJECT.", or a standalone
+# REJECT — so prose like "prior REJECTs are resolved" cannot false-trip the guard.
 reject_verdict = re.compile(r"^\s*[-*]?\s*Outcome:.*\bREJECT\b|^\s*[-*]?\s*REJECT\s*([:.].*)?$", re.I)
 
 approved = False
@@ -413,7 +579,7 @@ structured_current_round_approve() {
 }
 
 # Mechanical verify gate. Re-runs the task's verify_commands from the project
-# root after a reviewer round closes a task, so the final gate is proven by
+# root after a round closes a task, so the final gate is proven by
 # exit codes instead of the reviewer's claim (hollow-gate class, observed
 # 2026-06-29 and 2026-07-04: green reviewer claims whose gate commands had
 # never actually executed, and a REJECT-then-approve false close).
@@ -472,7 +638,7 @@ PYEOF
   while IFS= read -r cmd; do
     [[ -z "$cmd" ]] && continue
     rc=0
-    run_with_timeout bash -c "$cmd" > "$out_file" 2>&1 || rc=$?
+    run_with_timeout bash -c "$cmd" < /dev/null > "$out_file" 2>&1 || rc=$?
     if (( rc != 0 )); then
       echo "[$(ts)] mechanical verify gate: '$cmd' exited rc=$rc for $ID" >> "$LOG"
       tail -20 "$out_file" >> "$LOG" 2>&1 || true
@@ -546,23 +712,19 @@ PYEOF
   rm -f "$post_untracked" "$new_untracked"
 }
 
-# 1. Skip if rate-limit sleep marker is in the future.
-if [[ -f .coord/sleep-until ]]; then
-  NOW=$(date +%s)
-  UNTIL=$(cat .coord/sleep-until 2>/dev/null || echo 0)
-  if (( NOW < UNTIL )); then exit 0; fi
-  rm -f .coord/sleep-until
-fi
-
-# 2. Per-project lock — prevents overlapping ticks on the same project.
+# 1. Per-project lock — prevents overlapping ticks on the same project.
 # Uses noclobber instead of flock (flock is not available on macOS).
 LOCK=.coord/worker.lock
 if ! ( set -C; echo "$$" > "$LOCK" ) 2>/dev/null; then
   HOLDER=$(cat "$LOCK" 2>/dev/null || echo)
   if [[ -z "$HOLDER" ]] || ! kill -0 "$HOLDER" 2>/dev/null; then
     rm -f "$LOCK"
-    ( set -C; echo "$$" > "$LOCK" ) 2>/dev/null || exit 0
+    if ! ( set -C; echo "$$" > "$LOCK" ) 2>/dev/null; then
+      rm -f "${COORD_WORKER_SELF_COPY:-}"
+      exit 0
+    fi
   else
+    rm -f "${COORD_WORKER_SELF_COPY:-}"
     exit 0
   fi
 fi
@@ -585,36 +747,20 @@ cleanup() {
   rm -f "${COORD_WORKER_SELF_COPY:-}"
 }
 trap cleanup EXIT
+trap 'terminate_round 15' TERM
+trap 'terminate_round 2' INT
+trap 'terminate_round 1' HUP
+
+# 2. Discard the obsolete project-wide marker, then stop cheaply only when both
+# providers are cooling down. A single-provider cooldown remains available to
+# service work already assigned to the other provider.
+rm -f .coord/sleep-until
+if all_agents_rate_limited; then exit 0; fi
 
 # 3. Find the first runnable task through the shared path resolver.
+recover_interrupted_task_bookkeeping
 sync_clean_checkout || exit 0
-AGENT=claude
-PICKUP=$(python3 "$TOOLS/bin/coord" pickup --assigned="$AGENT" 2>> "$LOG" || true)
-ID=$(python3 - "$PICKUP" <<'PYEOF'
-import json, sys
-try:
-    payload = json.loads(sys.argv[1])
-except Exception:
-    sys.exit(0)
-if payload.get("decision") == "run":
-    print(payload.get("pickup", {}).get("id") or payload.get("task", {}).get("id") or "")
-PYEOF
-)
-if [[ -z "$ID" ]]; then
-  AGENT=codex
-  PICKUP=$(python3 "$TOOLS/bin/coord" pickup --assigned="$AGENT" 2>> "$LOG" || true)
-  ID=$(python3 - "$PICKUP" <<'PYEOF'
-import json, sys
-try:
-    payload = json.loads(sys.argv[1])
-except Exception:
-    sys.exit(0)
-if payload.get("decision") == "run":
-    print(payload.get("pickup", {}).get("id") or payload.get("task", {}).get("id") or "")
-PYEOF
-)
-fi
-if [[ -z "$ID" ]]; then exit 0; fi
+select_runnable_task || exit 0
 write_worker_state "picked-up" "$ID" "$AGENT"
 ROUND_ROLE=$(python3 - "$PICKUP" <<'PYEOF'
 import json, sys
@@ -840,6 +986,9 @@ else
 fi
 TICK_START=$(date +%s)
 TMPOUT=$(mktemp_suffix coord-worker-out json)
+AGENT_FINDING_FILE="/tmp/${AGENT}-finding-$(basename "$PROJ")-${ID}.txt"
+export COORD_AGENT_FINDING_FILE="$AGENT_FINDING_FILE"
+rm -f "$AGENT_FINDING_FILE"
 TASK_MAX_TURNS=$(python3 "$TOOLS/bin/coord" show "$ID" --compact 2>/dev/null | awk '/^max_turns:/ {print $2; exit}' || true)
 TASK_MAX_SECONDS=$(python3 "$TOOLS/bin/coord" show "$ID" --compact 2>/dev/null | awk '/^max_seconds:/ {print $2; exit}' || true)
 CLAUDE_MAX_TURNS_FLOOR=60
@@ -879,7 +1028,7 @@ if [[ "$AGENT" == "claude" ]]; then
 else
   PROMPT=$(mktemp_suffix coord-worker-prompt txt)
   # Resolve the finding file path and materialise the success command.
-  CODEX_FINDING_FILE="/tmp/codex-finding-${ID}.txt"
+  CODEX_FINDING_FILE="$AGENT_FINDING_FILE"
   CODEX_SUCCESS_CMD_RESOLVED="${CODEX_SUCCESS_CMD//@<file>/@$CODEX_FINDING_FILE}"
   # Reviewer rounds also get an explicit failure command: with only
   # success_update named, a REJECT verdict has no instructed path — observed
@@ -983,7 +1132,7 @@ if (( RC == 124 || RC == 137 )); then
   ROUND_TIMEOUT_TERMINAL=1
   echo "[$(ts)] round timeout (rc=$RC, budget=${ROUND_TIMEOUT_SECONDS}s, elapsed=${ELAPSED_SECONDS}s) for $ID" >> "$LOG"
   # Preserve any agent finding written before the timeout.
-  AGENT_FINDING_SRC="/tmp/${AGENT}-finding-${ID}.txt"
+  AGENT_FINDING_SRC="$AGENT_FINDING_FILE"
   if [[ -f "$AGENT_FINDING_SRC" && -s "$AGENT_FINDING_SRC" ]]; then
     FINDING_DEST=".coord/finding-${ID}-$(date +%Y%m%dT%H%M%S).txt"
     cp "$AGENT_FINDING_SRC" "$FINDING_DEST" 2>/dev/null || true
@@ -991,14 +1140,77 @@ if (( RC == 124 || RC == 137 )); then
   fi
 fi
 
+park_failed_demote() {
+  local issue="$1" demote_context="$2"
+  echo "[$(ts)] $demote_context; attempting second-chance park for $ID" >> "$LOG"
+  if ! python3 "$TOOLS/bin/coord" update "$ID" --status=needs-brainstorming --force \
+    --pickup-hold --add-issues="$issue; forced review-failed demote also failed; parked for human review" >> "$LOG" 2>&1; then
+    echo "[$(ts)] second-chance park update failed for $ID" >> "$LOG"
+    return 0
+  fi
+  echo "[$(ts)] second-chance park succeeded for $ID" >> "$LOG"
+}
+
+run_close_guards() {
+  # coord update auto-archives on the done transition INSIDE the same update
+  # call, so a closed task is usually already in the archive dir by the time
+  # these guards run — resolve the live location first.
+  local guard_task_path closed_status
+  guard_task_path="$TASK_PATH"
+  if [[ ! -f "$guard_task_path" ]]; then
+    local arch_cand
+    arch_cand="$(dirname "$TASK_PATH")/archive/$(basename "$TASK_PATH")"
+    if [[ -f "$arch_cand" ]]; then
+      guard_task_path="$arch_cand"
+    elif [[ -n "${COORD_ARCHIVE_DIR:-}" && -f "$COORD_ARCHIVE_DIR/$(basename "$TASK_PATH")" ]]; then
+      guard_task_path="$COORD_ARCHIVE_DIR/$(basename "$TASK_PATH")"
+    fi
+  fi
+  closed_status=$(awk '/^status:/{print $2; exit}' "$guard_task_path" 2>/dev/null || true)
+  [[ "$closed_status" == "done" ]] || return 2
+
+  if [[ "$ROUND_ROLE" == "reviewer" ]] \
+     && structured_current_round_verdict "$guard_task_path" "$AGENT" reject; then
+    echo "[$(ts)] reviewer false-approve guard: $AGENT finding says REJECT but $ID closed as done; demoting to review-failed" >> "$LOG"
+    python3 "$TOOLS/bin/coord" update "$ID" --status=review-failed --force \
+      --add-issues="worker false-approve guard: reviewer finding for this round says REJECT but the round closed the task as done; demoted back to the coder" >> "$LOG" 2>&1 \
+      || park_failed_demote \
+        "worker false-approve guard: reviewer finding for this round says REJECT but the round closed the task as done" \
+        "false-approve guard demote failed"
+  elif ! mechanical_verify_gate "$guard_task_path"; then
+    echo "[$(ts)] mechanical verify gate failed after ${ROUND_ROLE:-coder} close; demoting $ID to review-failed" >> "$LOG"
+    python3 "$TOOLS/bin/coord" update "$ID" --status=review-failed --force \
+      --add-issues="${MECH_VERIFY_ISSUE:-mechanical verify gate failed after reviewer close}" >> "$LOG" 2>&1 \
+      || park_failed_demote \
+        "${MECH_VERIFY_ISSUE:-mechanical verify gate failed after reviewer close}" \
+        "mechanical verify demote failed"
+  fi
+
+  # A done task has been handled even if both recovery updates failed.  Do not
+  # fall through to the ordinary non-forced failure update, which rejects done.
+  return 0
+}
+
+handle_max_turns_done_close() {
+  # The max-turns branch is terminal after a task has closed.  Keep a failed
+  # recovery update from tripping `set -e`; run_close_guards records it and
+  # deliberately handles the done state either way.
+  run_close_guards || true
+}
+
+handle_failed_round_done_close() {
+  run_close_guards
+}
+
 if (( RC != 0 )); then
   write_worker_state "failed" "$ID" "$AGENT"
   if "$TOOLS/worker/rate-limit.sh" check "$AGENT" "$TMPOUT"; then
     if restore_rate_limited_task; then
-      echo "[$(ts)] rate-limited; sleep-until set" >> "$LOG"
+      TENTATIVE_COMMITTED=$(commit_tentative_changes "$RC") || true
+      echo "[$(ts)] rate-limited; sleep-until.$AGENT set; tentative_commit=${TENTATIVE_COMMITTED:-0}" >> "$LOG"
       exit 0
     fi
-    rm -f .coord/sleep-until
+    rm -f ".coord/sleep-until.$AGENT"
     echo "[$(ts)] rate-limit detected but recovery failed; surfacing for human review" >> "$LOG"
   fi
   if [[ "$AGENT" == "codex" ]]; then
@@ -1009,7 +1221,8 @@ if (( RC != 0 )); then
   # Preserve agent output for post-mortem debugging.
   RUNS_DIR="$PROJ/.coord/agent-runs"
   mkdir -p "$RUNS_DIR"
-  ROUND_NUM=$(python3 "$TOOLS/bin/coord" show "$ID" --compact 2>/dev/null | grep '^round:' | awk '{print $2}')
+  ROUND_NUM=$(python3 "$TOOLS/bin/coord" show "$ID" --compact 2>/dev/null | grep '^round:' | awk '{print $2}' || true)
+  ROUND_NUM=${ROUND_NUM:-1}
   DEBUG_COPY="$RUNS_DIR/${ID}-r${ROUND_NUM:-0}-$(date +%Y%m%dT%H%M%S).json"
   cp "$TMPOUT" "$DEBUG_COPY" 2>/dev/null || true
   if [[ "${ROUND_TIMEOUT_TERMINAL:-0}" == "1" ]]; then
@@ -1145,10 +1358,11 @@ PYEOF
     if (( RETRIES_USED >= 1 )); then
       echo "[$(ts)] auto-requeue exhausted for $ID (retries_used=$RETRIES_USED); surfacing for human review" >> "$LOG"
     elif [[ "$CURRENT_STATUS" == "done" ]]; then
-      echo "[$(ts)] auto-requeue skipped for $ID: task already done" >> "$LOG"
+      echo "[$(ts)] auto-requeue skipped for $ID: task already done; running close guards" >> "$LOG"
+      handle_max_turns_done_close
       exit 0
     else
-      PROGRESS=$(python3 - "$PROJ" "$TASK_PATH" "/tmp/${AGENT}-finding-${ID}.txt" "$TICK_START" "${TENTATIVE_COMMITTED:-0}" "$AGENT" 2>/dev/null <<'PYEOF'
+      PROGRESS=$(python3 - "$PROJ" "$TASK_PATH" "$AGENT_FINDING_FILE" "$TICK_START" "${TENTATIVE_COMMITTED:-0}" "$AGENT" 2>/dev/null <<'PYEOF'
 import os, subprocess, sys
 proj, task_path, tmp_finding, tick_start_str, committed, agent = sys.argv[1:7]
 try:
@@ -1209,6 +1423,13 @@ PYEOF
     fi
   fi
 
+  # A closing agent can update the task to done before exiting non-zero or
+  # timing out. Guard that terminal state before attempting the normal failure
+  # handoff, which coord rightfully rejects for a done task without --force.
+  if handle_failed_round_done_close; then
+    exit 0
+  fi
+
   FINDING_FLAG="--append-${AGENT}-finding"
   NEEDS_BRAINSTORMING_RC=0
   if [[ "${ROUND_TIMEOUT_TERMINAL:-0}" == "1" ]]; then
@@ -1241,45 +1462,13 @@ ${TAIL:-(no output captured)}"
   exit 0
 fi
 
-# 5b. Reviewer false-approve guard. A reviewer agent (codex especially — the
-# structured scan above only runs on non-zero exits) can write a REJECT finding
-# yet still execute the success_update, closing the task unverified (observed
-# 2026-07-04: a reviewer wrote "Outcome: REJECT" yet ran success_update while
-# the verify target was unreachable, closing the task as done). If this was a
-# reviewer round, the task ended closed, and the current round's finding
-# carries an explicit REJECT verdict, demote back to the coder instead of
-# letting the false close stand.
-if [[ "$ROUND_ROLE" == "reviewer" ]]; then
-  # coord update auto-archives on the done transition INSIDE the same update
-  # call, so a falsely-closed task is usually already in the archive dir by
-  # the time this guard runs — resolve the live location first.
-  GUARD_TASK_PATH="$TASK_PATH"
-  if [[ ! -f "$GUARD_TASK_PATH" ]]; then
-    ARCH_CAND="$(dirname "$TASK_PATH")/archive/$(basename "$TASK_PATH")"
-    if [[ -f "$ARCH_CAND" ]]; then
-      GUARD_TASK_PATH="$ARCH_CAND"
-    elif [[ -n "${COORD_ARCHIVE_DIR:-}" && -f "$COORD_ARCHIVE_DIR/$(basename "$TASK_PATH")" ]]; then
-      GUARD_TASK_PATH="$COORD_ARCHIVE_DIR/$(basename "$TASK_PATH")"
-    fi
-  fi
-  CLOSED_STATUS=$(awk '/^status:/{print $2; exit}' "$GUARD_TASK_PATH" 2>/dev/null || true)
-  if [[ "$CLOSED_STATUS" == "done" ]] \
-     && structured_current_round_verdict "$GUARD_TASK_PATH" "$AGENT" reject; then
-    echo "[$(ts)] reviewer false-approve guard: $AGENT finding says REJECT but $ID closed as done; demoting to review-failed" >> "$LOG"
-    python3 "$TOOLS/bin/coord" update "$ID" --status=review-failed --force \
-      --add-issues="worker false-approve guard: reviewer finding for this round says REJECT but the round closed the task as done; demoted back to the coder" >> "$LOG" 2>&1 \
-      || echo "[$(ts)] false-approve guard demote failed for $ID" >> "$LOG"
-  elif [[ "$CLOSED_STATUS" == "done" ]]; then
-    # 5c. Mechanical verify gate: the reviewer closed the task — prove the
-    # final gate with exit codes before letting done stand.
-    if ! mechanical_verify_gate "$GUARD_TASK_PATH"; then
-      echo "[$(ts)] mechanical verify gate failed after reviewer close; demoting $ID to review-failed" >> "$LOG"
-      python3 "$TOOLS/bin/coord" update "$ID" --status=review-failed --force \
-        --add-issues="${MECH_VERIFY_ISSUE:-mechanical verify gate failed after reviewer close}" >> "$LOG" 2>&1 \
-        || echo "[$(ts)] mechanical verify demote failed for $ID" >> "$LOG"
-    fi
-  fi
-fi
+"$TOOLS/worker/rate-limit.sh" reset "$AGENT"
+
+# 5b/5c. A completed round gets the same false-approve and mechanical close
+# guards used by the terminal failure path above: a reviewer finding that says
+# REJECT cannot stand as done, and any round (coder or reviewer) that closes
+# the task must pass the mechanical verify gate.
+run_close_guards || true
 
 # 6. Commit successful agent work before recording wrapper token usage.
 if ! commit_agent_changes; then
@@ -1288,6 +1477,10 @@ if ! commit_agent_changes; then
 fi
 
 STAGE_LABEL="${CURRENT_SUBTASK:-}"
+case "${ROUND_ROLE:-}" in
+  reviewer) STAGE_LABEL="review" ;;
+  architect) STAGE_LABEL="arch" ;;
+esac
 if [[ -z "$STAGE_LABEL" ]]; then
   case "${ORIG_STATUS:-}" in
     needs-review) STAGE_LABEL="fix" ;;
@@ -1351,8 +1544,6 @@ round_role = sys.argv[7] if len(sys.argv) > 7 else ""
 usage_file = sys.argv[8] if len(sys.argv) > 8 else ""
 sys.path.insert(0, os.path.join(tools, "bin"))
 from coord_token_effective import effective_tokens
-# Fall back to a role tag (review/arch) when there is no subtask label, so the
-# token row's Stage column shows what the round was instead of being blank.
 if not subtask:
     if round_role == "reviewer":
         subtask = "review"

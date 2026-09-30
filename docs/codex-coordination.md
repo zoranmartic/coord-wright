@@ -16,7 +16,7 @@ python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" release --all-he
 
 Normal tasks are Codex-first and usually Codex-only. `--solo` and `--overnight` are compatibility aliases only: they may set Codex/tag defaults, but they do not bypass shaping, subtask metadata, Plan, acceptance, or verifier validation. For unattended batches, create tasks with `pickup_hold: true` (`coord new --hold` or `coord update --pickup-hold=true`), finish all metadata updates, then release them with one `coord release` command. Add explicit `roles.reviewer` for independent review, and add `roles.architect` only when a design handoff must run inside the wrapper after shaping. When the operator's request names a reviewer in prose ("claude as reviewer"), that MUST land as `--roles=reviewer:claude` at shape time — omitting `roles` silently means no review round.
 
-When the wrapper has already resolved the active task and subtask, start from that handoff packet instead of rediscovering with pickup helpers. The startup packet already carries the bounded handoff text, active subtask, and execution policy.
+When the wrapper has already resolved the active task and subtask, start from that handoff packet instead of rediscovering with pickup helpers. The startup prompt carries the task id, the resolved execution policy (work mode and success command), and tells Codex to start from `show <id> --handoff`.
 
 ## Pickup model
 
@@ -31,13 +31,13 @@ Tasks with `pickup_hold: true` are also skipped by `precheck` and `pickup` until
 1. `launchd` starts the shared `worker/worker.sh`.
 2. The wrapper resolves one `pickup --assigned=codex` packet before launching Codex. If pickup returns `skip`, the run exits cheaply without starting Codex.
 3. Immediately before launching Claude or Codex, the wrapper re-reads the same task. If the content hash, status, assignee, hold flag, resolved model, resolved reasoning effort, or round role changed since pickup, it logs `stale-pickup` and exits 0 so the next launchd tick uses fresh metadata.
-4. The pickup packet already includes the handoff text, next subtask, and the Codex execution policy for plan gating and the required `coord update` path. Codex follows the normal read ladder from there: `--compact`, then `show-signatures`, then targeted file reads, and full `show` only if still blocked. For `simple` tasks, the prompt biases Codex toward the target file before broader repo docs, and tells it not to open coordination skill docs unless the task is actually coordination work or the handoff is missing a specific policy detail.
+4. The Codex prompt carries the task id and the resolved execution policy (`work_mode`, `success_update.command`); reviewer rounds also get a `failure_update` command. Codex starts from `show <id> --handoff` (a short header), runs `coord next-subtask <id>`, then follows the read ladder: `--compact`, targeted file reads, and full `show` only if still blocked.
 5. Codex launches are pinned with explicit non-interactive startup flags (`-a never`, `-s danger-full-access`) instead of inheriting interactive defaults. If the project sets `CODEX_SERVICE_TIER=fast`, the wrapper launches `codex exec` with `service_tier="fast"` and enables the Codex `fast_mode` feature, matching CLI `/fast`. The wrapper also passes the pickup packet's resolved reasoning effort as `model_reasoning_effort`.
 6. Codex edits files in the project repo.
 7. While Codex is running, the wrapper publishes a small state file so the watchdog can tell the difference between healthy work, stale locks, and a wedged run.
 8. Codex writes findings back through `coord update`, including any round-local smoke checks. Final `verify_commands` stay reserved for the end-of-task acceptance gate.
 9. The wrapper commits the round, records runtime warnings such as `closed-stdin`, records a Codex token row or token warning,
-   and triggers Claude's side.
+   and exits; the next launchd tick picks up whichever agent is assigned.
 
 Manual `/coord-check` Codex rounds run outside the launchd wrapper, so they
 self-report tokens through `coord-tokens.sh --agent=codex` when
@@ -72,8 +72,8 @@ When Codex creates or reshapes tasks, treat "create a task" as a design request.
 - Keep `scope` as narrow as the next round allows. Use specific files or focused directories once the implementation surface is known.
 - Keep findings short after discovery: changed files, verification result, blockers, and handoff notes.
 - If token telemetry shows high cache/input or repeated oversized effective context, finish the current narrow step and create a follow-on task from a compact handoff rather than growing the same task.
-- Task-shaping warnings are fatal by default for runnable task creation and `update --set-subtasks` unless a human records `--shape-override=<reason>`. Use `--brainstorm` when the work is not narrow enough to queue.
-- Do not stop after creating `status: shaping` task files. A shaped task must be handoff-ready in `show --handoff`.
+- Task-shaping warnings are fatal for runnable task creation and `update --set-subtasks`; there is no bypass flag. Use `--brainstorm` when the work is not narrow enough to queue.
+- Do not stop after creating `status: shaping` task files. A shaped task must pass `coord promote` validation and `coord-review`.
 - Do not add an architect role by default. Architecture and decomposition should happen before or during shaping, then be encoded as subtasks and `depends_on` chains.
 - For explicit Codex architect rounds, persist a narrow executable subtask checklist with `coord update --set-subtasks` before handing off to the coder queue.
 - For high-risk migration, cutover, destructive cleanup, auth/security, money, trading, or live-operations work, prefer narrow dependent tasks plus explicit review. Add `roles.architect` only when there is still a real in-loop design step after shaping.
@@ -99,28 +99,7 @@ The shared concept and generic regex override are documented in `coordination.md
 
 Precedence is Codex-specific override -> generic override -> built-in default.
 
-When Codex hits a transient limit, the wrapper matches the Codex output artifact, restores any `codex-working` task to the pre-pickup runnable status and assignee, records a retry-after marker, and exits. The worker honors that marker and resumes normal pickup after the retry window expires.
-
-## Prompt observability
-
-Every Codex wrapper run logs a prompt-size summary to the debug log before launching `codex exec`. The summary includes per-section character/line counts plus a rough `chars / 4` token estimate for the wrapper boilerplate, handoff packet, next-subtask block, execution policy block, and AGENTS path reminder. This makes it possible to tell whether a "large input" round was already expensive before Codex opened any files.
-
-For deeper debugging, set:
-
-- `CODEX_COORD_DEBUG_PROMPT_MODE=full` to append the full rendered prompt to the debug log
-- `CODEX_COORD_DEBUG_PROMPT_FILE=/tmp/some-path.txt` to preserve a copy of the rendered prompt on disk
-
-## Context escalation visibility
-
-The wrapper flags rounds where input tokens exceed the measured wrapper-prompt floor plus 3× a configurable baseline. When a round's input exceeds the threshold, the token log entry gets a trailing `:e` flag and the rate-flag column shows `<rate> esc` (e.g., `high esc`, `ok esc`).
-
-The adjustable part is controlled by `CODEX_COORD_ESCALATION_INPUT_BASELINE` (default: `1500` tokens):
-
-`estimated prompt tokens + (CODEX_COORD_ESCALATION_INPUT_BASELINE * 3)`
-
-This keeps large injected handoff/policy prompts from tripping `esc` by themselves, while still marking rounds that grew well beyond the wrapper-provided startup context.
-
-To raise the threshold for naturally large tasks, set `CODEX_COORD_ESCALATION_INPUT_BASELINE=<N>` in the project's `.coord/config.env` or the launchd plist EnvironmentVariables. The flag is informational — it does not stop or slow the round, only marks it for operator review.
+When Codex hits a transient limit, the wrapper matches the Codex output artifact, restores any `codex-working` task to the pre-pickup runnable status and original assignee, records `.coord/sleep-until.codex`, then commits and pushes scoped tentative edits before exiting. Later ticks skip Codex until that marker expires but may run already-assigned Claude work; out-of-scope dirt remains fail-closed. The worker never reassigns a role because of a provider cooldown.
 
 ## Sandbox: keep coord worker on `danger-full-access`
 

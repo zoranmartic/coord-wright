@@ -21,7 +21,7 @@ Read `task-files-reference.md` only when authoring or transitioning tasks.
 
 1. Resolve the canonical project root. Do not mutate queue state from sibling task worktrees.
 2. Inspect the handoff or task with the smallest useful coord view: `show --handoff`, then `show --compact`, then scoped files only if needed.
-3. Check wrapper state files such as `/tmp/codex-coord-check-<label>.state`.
+3. Check the project's state files and log: `.coord/worker.state`, `.coord/worker.log`.
 4. Check launchd service state, recent logs, and provider retry markers.
 5. Check whether the task is genuinely runnable or blocked by `depends_on`.
 6. Check whether main checkout dirt or fast-forward failure prevented pickup.

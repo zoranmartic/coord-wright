@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -213,6 +214,102 @@ class CoordCommitAgentTests(unittest.TestCase):
             log_path.read_text(encoding="utf-8"),
         )
 
+    def test_scoped_commit_keeps_scope_when_coord_paths_fails(self):
+        repo = self.init_repo()
+        base_status = self.write_base_status()
+        scope = self.write_scope_file(["src/**"])
+        (repo / "src").mkdir()
+        (repo / "src" / "in-scope.py").write_text("print('hi')\n", encoding="utf-8")
+        (repo / "unrelated.txt").write_text("out of scope\n", encoding="utf-8")
+        real_python = shutil.which("python3")
+        fake_bin = repo / ".fake-bin"
+        fake_bin.mkdir()
+        fake = fake_bin / "python3"
+        fake.write_text(
+            "#!/bin/sh\n"
+            'case "$*" in *" paths"*) exit 1 ;; esac\n'
+            f'exec "{real_python}" "$@"\n',
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        saved_path = os.environ["PATH"]
+        os.environ["PATH"] = f"{fake_bin}:{saved_path}"
+        try:
+            result = self.run_helper(repo, base_status, scope_file=scope)
+        finally:
+            os.environ["PATH"] = saved_path
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        committed = self.git(repo, "show", "--name-only", "--pretty=", "HEAD").stdout.split()
+        self.assertIn("src/in-scope.py", committed)
+        self.assertNotIn("unrelated.txt", committed)
+
+    def test_scoped_commit_stages_configured_tasks_dir(self):
+        repo = self.init_repo()
+        (repo / ".coord").mkdir()
+        (repo / ".coord" / "config.env").write_text(
+            "COORD_TASKS_DIR=ops/queue\n"
+            "COORD_ARCHIVE_DIR=ops/queue/archive\n"
+            "COORD_FINDINGS_DIR=ops/findings\n"
+            "COORD_CHANGES_FILE=ops/CHANGES.md\n",
+            encoding="utf-8",
+        )
+        self.git(repo, "add", ".")
+        self.git(repo, "commit", "-m", "configure tasks dir")
+        base_status = self.write_base_status()
+        scope = self.write_scope_file(["src/**"])
+        (repo / "src").mkdir()
+        (repo / "src" / "in-scope.py").write_text("print('hi')\n", encoding="utf-8")
+        (repo / "ops" / "queue" / "archive").mkdir(parents=True)
+        (repo / "ops" / "queue" / "2026-05-16-test-helper.md").write_text("task\n", encoding="utf-8")
+        (repo / "ops" / "queue" / "archive" / "old.md").write_text("old\n", encoding="utf-8")
+        (repo / "ops" / "findings").mkdir()
+        (repo / "ops" / "findings" / "f.md").write_text("finding\n", encoding="utf-8")
+        (repo / "ops" / "CHANGES.md").write_text("changes\n", encoding="utf-8")
+        (repo / "tasks").mkdir()
+        (repo / "tasks" / "not-coord.md").write_text("project file\n", encoding="utf-8")
+
+        env_keys = ("COORD_TASKS_DIR", "COORD_ARCHIVE_DIR", "COORD_FINDINGS_DIR", "COORD_CHANGES_FILE")
+        saved = {key: os.environ.pop(key, None) for key in env_keys}
+        try:
+            result = self.run_helper(repo, base_status, scope_file=scope)
+        finally:
+            os.environ.update({key: val for key, val in saved.items() if val is not None})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        committed = self.git(repo, "show", "--name-only", "--pretty=", "HEAD").stdout.split()
+        self.assertEqual(
+            sorted(committed),
+            [
+                "ops/CHANGES.md",
+                "ops/findings/f.md",
+                "ops/queue/2026-05-16-test-helper.md",
+                "ops/queue/archive/old.md",
+                "src/in-scope.py",
+            ],
+        )
+        self.assertEqual(
+            self.git(repo, "status", "--porcelain", "--untracked-files=all").stdout.strip(),
+            "?? tasks/not-coord.md",
+        )
+
+    def test_scoped_commit_leaves_pre_staged_out_of_scope_file_uncommitted(self):
+        repo = self.init_repo()
+        base_status = self.write_base_status()
+        scope = self.write_scope_file(["src/**"])
+        (repo / "src").mkdir()
+        (repo / "src" / "in-scope.py").write_text("print('hi')\n", encoding="utf-8")
+        (repo / "stray.txt").write_text("concurrent edit\n", encoding="utf-8")
+        self.git(repo, "add", "stray.txt")
+
+        result = self.run_helper(repo, base_status, scope_file=scope)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        committed = self.git(repo, "show", "--name-only", "--pretty=", "HEAD").stdout.split()
+        self.assertIn("src/in-scope.py", committed)
+        self.assertNotIn("stray.txt", committed)
+        self.assertEqual(self.git(repo, "status", "--porcelain").stdout.strip(), "?? stray.txt")
+
     def test_scoped_commit_with_only_out_of_scope_changes_skips_commit(self):
         repo = self.init_repo()
         base_status = self.write_base_status()
@@ -257,6 +354,45 @@ class CoordCommitAgentTests(unittest.TestCase):
         committed = self.git(repo, "show", "--name-only", "--pretty=", "HEAD").stdout.split()
         self.assertIn("src/in-scope.py", committed)
         self.assertNotIn("stray.txt", committed)
+
+    def test_tentative_commit_failure_returns_nonzero_and_prints_zero(self):
+        repo = self.init_repo()
+        base_status = self.write_base_status()
+        (repo / "agent-edit.txt").write_text("agent edit\n", encoding="utf-8")
+        hook = repo / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        hook.chmod(0o755)
+
+        result = self.run_tentative_helper(repo, base_status)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "0\n")
+        self.assertEqual(self.commit_count(repo), 1)
+
+    def test_work_commit_failure_propagates_under_if_not(self):
+        repo = self.init_repo()
+        base_status = self.write_base_status()
+        (repo / "agent-edit.txt").write_text("agent edit\n", encoding="utf-8")
+        hook = repo / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        hook.chmod(0o755)
+        env = os.environ.copy()
+        env.update({
+            "COORD_TASK_ID": "2026-05-16-test-helper",
+            "COORD_AGENT": "codex",
+            "COORD_BASE_GIT_STATUS_FILE": str(base_status),
+        })
+
+        result = subprocess.run(
+            ["bash", "-c", f"source {HELPER}; if ! commit_agent_changes; then exit 0; fi; exit 1"],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.commit_count(repo), 1)
 
     def test_tentative_outside_git_worktree_exits_zero(self):
         workdir = self.root / "not-a-repo"

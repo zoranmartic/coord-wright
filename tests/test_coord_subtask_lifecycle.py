@@ -154,7 +154,8 @@ class SubtaskLifecycleTests(unittest.TestCase):
                 python3 "{COORD}" update "$COORD_TASK_ID" --append-claude-finding 'Outcome: APPROVE. Structured current-round reviewer finding.'
                 ;;
               timeout)
-                printf 'partial timeout finding\\n' > "/tmp/claude-finding-$COORD_TASK_ID.txt"
+                test ! -e "$COORD_AGENT_FINDING_FILE"
+                printf 'partial timeout finding\\n' > "${{COORD_AGENT_FINDING_FILE:-/tmp/claude-finding-$COORD_TASK_ID.txt}}"
                 sleep 10
                 printf '{{"result":"late success"}}\\n'
                 exit 0
@@ -314,6 +315,62 @@ class SubtaskLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, msg=result.stderr)
 
+    def test_append_finding_demotes_level_two_headings(self):
+        path = self.write_task("t-finding-heading", subtasks=[])
+
+        result = _coord(
+            "update", "t-finding-heading", "--append-codex-finding",
+            "Outcome: APPROVE\n## Evidence\nHeading remains in this finding.",
+            cwd=self.root,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        text = path.read_text(encoding="utf-8")
+        findings = COORD_MODULE["get_section"](text.split("---\n", 2)[2], "Codex findings")
+        self.assertIn("### Evidence", findings)
+        self.assertNotIn("\n## Evidence\n", text)
+
+    def test_update_handles_a_malformed_round_without_a_traceback(self):
+        path = self.write_task("t-malformed-round", subtasks=[], status="codex-working")
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("round: 1", "round: not-a-number"),
+            encoding="utf-8",
+        )
+
+        result = _coord(
+            "update", "t-malformed-round", "--append-codex-finding", "Recovered safely.",
+            cwd=self.root,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_set_subtasks_preserves_scope_notes_after_checklist(self):
+        path = self.write_task("t-scope-suffix", subtasks=[(1, "Original", False)])
+        text = path.read_text(encoding="utf-8")
+        path.write_text(
+            text.replace("\n## Plan", "\nPre-fetched signatures: keep this scope note.\n\n## Plan"),
+            encoding="utf-8",
+        )
+        subtasks = textwrap.dedent("""\
+            - [ ] **S1: Replacement**
+              complexity: simple
+              model_claude: sonnet
+              model_codex: gpt-5.6-sol
+              Replacement body.
+              Writes handoff: `.coord/handoffs/<task-id>/S1.md`.
+            """)
+
+        result = _coord("update", "t-scope-suffix", "--set-subtasks", subtasks, cwd=self.root, check=False)
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        updated = path.read_text(encoding="utf-8")
+        self.assertIn("S1: Replacement", updated)
+        self.assertNotIn("S1: Original", updated)
+        self.assertIn("Pre-fetched signatures: keep this scope note.", updated)
+
     # ── handoff-present gate ──────────────────────────────────────────────────
 
     def _write_handoff(self, task_id, sub_id):
@@ -432,8 +489,9 @@ class SubtaskLifecycleTests(unittest.TestCase):
 
     def test_python_timeout_fallback_enforces_max_seconds_and_annotates_artifact(self):
         task_id = "t-worker-timeout-fallback"
-        tmp_finding = Path(f"/tmp/claude-finding-{task_id}.txt")
-        tmp_finding.unlink(missing_ok=True)
+        tmp_finding = Path(f"/tmp/claude-finding-{self.root.name}-{task_id}.txt")
+        tmp_finding.write_text("stale finding\n", encoding="utf-8")
+        self.addCleanup(lambda: tmp_finding.unlink(missing_ok=True))
         path = self.write_task(
             task_id,
             subtasks=[(1, "First", False)],

@@ -2,7 +2,7 @@
 """coord — task management CLI (replaces coord.js from the legacy coord checkout).
 
 Implements the subcommands used by coord-* skills:
-  show <id> [--compact] [--handoff] [--path]
+  show <id> [--compact] [--handoff] [--result] [--path]
   list [--status=csv] [--assigned=csv] [--search=str] [--format=ids|table] [--limit=N]
   status
   update <id> [flags — see update section below]
@@ -114,6 +114,12 @@ def validate_transition(prev: str, new: str, in_archive: bool, force: bool = Fal
         return (f"transition {prev!r} → {new!r} requires the task to be in tasks/, "
                 f"but this task is archived")
     return None
+
+# Top-level keys whose value is a list; only these parse `[a, b]` flow lists.
+LIST_FRONTMATTER_KEYS = frozenset({
+    "acceptance", "verify_commands", "depends_on", "scope", "scope_creates", "tags",
+    "token_log", "token_warnings", "runtime_warnings", "quota_log",
+})
 
 FRONTMATTER_KEY_ORDER = [
     "id", "task", "status", "assigned", "agents",
@@ -288,19 +294,24 @@ def _parse_fm(text):
             continue
         key, val_raw = m.group(1), m.group(2).strip()
 
-        # Collect indented children
+        # Collect indented children and column-0 list items.
         j = i + 1
         children = []
         while j < len(lines):
-            if lines[j] and lines[j][0] != " ":
+            child = lines[j]
+            if child and child[0] != " " and not (not val_raw and re.match(r"^-\s", child)):
                 break
-            children.append(lines[j])
+            children.append(child)
             j += 1
 
         non_empty = [c for c in children if c.strip()]
         if non_empty:
-            if re.match(r"^\s+-\s", non_empty[0]):
-                result[key] = [re.sub(r"^\s+-\s", "", c) for c in non_empty if c.strip()]
+            if re.match(r"^\s*-\s", non_empty[0]):
+                result[key] = [
+                    _list_item_scalar(re.sub(r"^\s*-\s", "", c))
+                    for c in non_empty
+                    if c.strip()
+                ]
             else:
                 mapping = {}
                 for c in non_empty:
@@ -310,7 +321,15 @@ def _parse_fm(text):
                 result[key] = mapping
             i = j
         else:
-            result[key] = _scalar(val_raw)
+            if (key in LIST_FRONTMATTER_KEYS and val_raw.startswith("[")
+                    and val_raw.endswith("]") and "," in val_raw):
+                result[key] = [
+                    _list_item_scalar(item.strip())
+                    for item in _split_flow_list(val_raw[1:-1])
+                    if item.strip()
+                ]
+            else:
+                result[key] = _scalar(val_raw)
             i += 1
     return result
 
@@ -338,6 +357,41 @@ def _scalar(s):
     return s
 
 
+def _split_flow_list(s):
+    items = []
+    start = 0
+    quote = None
+    escaped = False
+    for i, char in enumerate(s):
+        if quote:
+            if escaped:
+                escaped = False
+            elif quote == '"' and char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+        elif char == ",":
+            items.append(s[start:i])
+            start = i + 1
+    items.append(s[start:])
+    return items
+
+
+def _list_item_scalar(s):
+    # Items stay raw, except the JSON-quoted forms _quote_list_item writes for
+    # values that cannot be written bare (empty, or containing a line break).
+    if s.startswith('"') and s.endswith('"') and len(s) >= 2:
+        try:
+            value = json.loads(s)
+        except json.JSONDecodeError:
+            return s
+        if isinstance(value, str) and (value == "" or "\n" in value or "\r" in value):
+            return value
+    return s
+
+
 def _quote_if_needed(s):
     """Return YAML-safe scalar string."""
     if s is None:
@@ -345,11 +399,25 @@ def _quote_if_needed(s):
     s = str(s)
     need_quote = (
         s in ("true", "false", "null", "~", "")
+        or "\n" in s
+        or "\r" in s
+        or re.fullmatch(r"[+-]?\d+", s) is not None
         or s.startswith(("#", "{", "[", "!", "|", ">", '"', "'", "`", "&", "*"))
         or ": " in s
         or " #" in s
     )
     if need_quote:
+        return json.dumps(s)
+    return s
+
+
+def _quote_list_item(item):
+    if item is None:
+        return "null"
+    if isinstance(item, bool):
+        return "true" if item else "false"
+    s = str(item)
+    if s == "" or "\n" in s or "\r" in s:
         return json.dumps(s)
     return s
 
@@ -379,7 +447,7 @@ def _fm_to_yaml(fm):
             else:
                 lines.append(f"{key}:")
                 for item in val:
-                    lines.append(f"  - {item}")
+                    lines.append(f"  - {_quote_list_item(item)}")
         elif isinstance(val, dict):
             lines.append(f"{key}:")
             for k2, v2 in val.items():
@@ -387,6 +455,8 @@ def _fm_to_yaml(fm):
                     lines.append(f"  {k2}:")
                 elif isinstance(v2, bool):
                     lines.append(f"  {k2}: {'true' if v2 else 'false'}")
+                elif isinstance(v2, int):
+                    lines.append(f"  {k2}: {v2}")
                 else:
                     lines.append(f"  {k2}: {_quote_if_needed(str(v2))}")
         else:
@@ -404,8 +474,11 @@ def write_task(path, fm, body):
 
 
 def _now():
-    # Europe/Dublin local with %z offset — matches worker.sh ts(); still ISO 8601.
-    return datetime.datetime.now(ZoneInfo("Europe/Dublin")).strftime("%Y-%m-%dT%H:%M:%S%z")
+    # COORD_TZ (IANA name) or system local time, with %z offset — matches
+    # worker.sh ts(); still ISO 8601.
+    tz_name = os.environ.get("COORD_TZ")
+    now = datetime.datetime.now(ZoneInfo(tz_name)) if tz_name else datetime.datetime.now().astimezone()
+    return now.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
 def _parse_coord_time(value):
@@ -445,7 +518,7 @@ def handoff_timing_lines(fm):
 
 # ── File lookup ────────────────────────────────────────────────────────────────
 
-def find_task(task_id):
+def find_task_exact(task_id):
     paths = configured_paths()
     for base in paths["active_read_dirs"]:
         p = task_path_in_base(base, task_id)
@@ -459,19 +532,36 @@ def find_task(task_id):
                 continue
             if os.path.basename(p) == f"{task_id}.md" and valid_task_file(p):
                 return p
+    return None
+
+
+def find_task(task_id):
+    paths = configured_paths()
+    exact = find_task_exact(task_id)
+    if exact:
+        return exact
+
     # Fuzzy: prefix/substring match
+    matches = []
     for base in paths["active_read_dirs"]:
         for p in sorted(glob.glob(os.path.join(base, "*.md"))):
             if not path_within_base(p, base):
                 continue
             if task_id in os.path.basename(p) and valid_task_file(p):
-                return p
+                matches.append(p)
     for base in paths["archive_read_dirs"]:
         for p in sorted(glob.glob(task_glob(base, recursive=True), recursive=True)):
             if not path_within_base(p, base):
                 continue
             if task_id in os.path.basename(p) and valid_task_file(p):
-                return p
+                matches.append(p)
+    if len(matches) > 1:
+        print(f"ambiguous task id: {task_id}; candidates: "
+              + ", ".join(os.path.splitext(os.path.basename(p))[0] for p in matches),
+              file=sys.stderr)
+        return None
+    if matches:
+        return matches[0]
     return None
 
 
@@ -508,7 +598,7 @@ def dependency_statuses(fm):
         dep_id = str(raw_dep).strip()
         if not dep_id:
             continue
-        dep_path = find_task(dep_id)
+        dep_path = find_task_exact(dep_id)
         if not dep_path:
             result.append({"id": dep_id, "status": "missing"})
             continue
@@ -533,31 +623,68 @@ def git(*args, check=False):
 
 
 def commit_and_push(path, message):
-    commit_and_push_paths([path], message)
+    return commit_and_push_paths([path], message)
 
 
 def commit_and_push_paths(paths, message):
+    """Commit exactly `paths` and push. Returns False on any git failure.
+
+    Only the named paths are committed, so unrelated staged or dirty files in
+    the checkout stay out of the queue commit. A local-only queue (no remote,
+    or no upstream branch) is a supported state, not a failure.
+    """
+    repo_root = git("rev-parse", "--show-toplevel").stdout.strip()
+    if not repo_root:
+        print("git rev-parse --show-toplevel failed", file=sys.stderr)
+        return False
+
+    def repo_path(path):
+        return os.path.relpath(os.path.abspath(path), repo_root)
+
+    # A path that is neither on disk nor in HEAD (an uncommitted task moved to
+    # the archive) has nothing to commit, and naming it makes pathspecs fail.
+    paths = [repo_path(p) for p in paths]
+    paths = [p for p in paths if os.path.exists(p) or git("cat-file", "-e", f"HEAD:{p}").returncode == 0]
+    if not paths:
+        return True
     for path in paths:
-        r = git("add", path)
+        # A path moved away (archive/unarchive) is staged as a deletion instead.
+        if os.path.exists(path):
+            r = git("add", path)
+        else:
+            r = git("rm", "--cached", "--ignore-unmatch", "-q", "--", path)
         if r.returncode != 0:
             print(f"git add {path} failed: {r.stderr.strip()}", file=sys.stderr)
-            sys.exit(1)
-    if git("diff", "--cached", "--quiet").returncode == 0:
-        # Nothing staged (idempotent rewrite): no commit needed. More robust
-        # than matching git's "nothing (added) to commit" message variants.
-        return
-    r = git("commit", "-m", message)
-    if r.returncode != 0:
-        print(f"git commit failed: {(r.stderr or r.stdout).strip()}", file=sys.stderr)
-        sys.exit(1)
-    remotes = git("remote")
-    if not remotes.stdout.strip():
-        # Local-only queue (no remote configured) is a supported state.
-        return
+            return False
+    if git("diff", "--cached", "--quiet", "--", *paths).returncode != 0:
+        r = git("commit", "-m", message, "--", *paths)
+        if r.returncode != 0:
+            print(f"git commit failed: {(r.stderr or r.stdout).strip()}", file=sys.stderr)
+            return False
+    if not git("remote").stdout.strip():
+        print("git push skipped: no configured push destination", file=sys.stderr)
+        return True
     r = git("push")
-    if r.returncode != 0:
-        print(f"git push failed: {r.stderr.strip()}", file=sys.stderr)
-        sys.exit(1)
+    if r.returncode == 0:
+        return True
+    output = r.stdout + r.stderr
+    if "No configured push destination" in output or "has no upstream branch" in output:
+        print("git push skipped: no configured push destination", file=sys.stderr)
+        return True
+    if "non-fast-forward" in output or "fetch first" in output:
+        # Mid-round the worktree is normally dirty, so autostash; never leave
+        # the checkout stuck in a half-finished rebase.
+        rebase = git("pull", "--rebase", "--autostash")
+        if rebase.returncode == 0:
+            r = git("push")
+            if r.returncode == 0:
+                return True
+            output = r.stdout + r.stderr
+        else:
+            git("rebase", "--abort")
+            output = rebase.stdout + rebase.stderr
+    print(f"git push failed: {output.strip()}", file=sys.stderr)
+    return False
 
 # ── Content hash ───────────────────────────────────────────────────────────────
 
@@ -565,7 +692,13 @@ def content_hash(fm, body):
     skip = {"content_hash_claude", "content_hash_codex", "token_log", "token_warnings", "runtime_warnings", "quota_log",
             "round", "attempts", "updated", "created", "started", "completed"}
     clean = {k: v for k, v in fm.items() if k not in skip}
-    payload = {"fm": clean, "body": body}
+    # Generated sections change on every token/runtime record; excluding them
+    # keeps the pickup dedup hash stable across bookkeeping-only updates.
+    stable_body = join_sections([
+        (hdr, content) for hdr, content in split_sections(body)
+        if hdr not in {"Token usage", "Runtime warnings"}
+    ])
+    payload = {"fm": clean, "body": stable_body}
     if fm.get("depends_on"):
         payload["dependency_statuses"] = dependency_statuses(fm)
     payload = json.dumps(payload, sort_keys=True, default=str)
@@ -595,6 +728,17 @@ def as_list(val):
         return []
     if is_empty_list_literal(text):
         return []
+    if text.lstrip().startswith("["):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            return [
+                str(x).strip()
+                for x in parsed
+                if str(x).strip() and not is_empty_list_literal(x)
+            ]
     if "\n" in text:
         return [
             l.strip()
@@ -695,7 +839,8 @@ def append_round(section_content, round_n, text):
     """Append ### Round N block to a findings section."""
     existing = (section_content or "").rstrip()
     header = f"### Round {round_n}"
-    block = f"\n\n{header}\n\n{text.strip()}\n"
+    text = re.sub(r"(?m)^## ", "### ", text.strip())
+    block = f"\n\n{header}\n\n{text}\n"
     return (existing + block) if existing.strip() else block
 
 
@@ -909,7 +1054,7 @@ def parse_subtasks(scope_content):
     ]
 
 
-def validate_subtask_block(subtask_text):
+def validate_subtask_block(subtask_text, check_baseline=True):
     errors = []
     text = (subtask_text or "").strip()
     if not text:
@@ -955,11 +1100,12 @@ def validate_subtask_block(subtask_text):
             errors.append(f"S{sub_n}: missing {', '.join(missing)}")
         for warning in validate_subtask_shape(title, body):
             errors.append(f"S{sub_n}: {warning}")
-        for warning in validate_complexity_pair(
-            complexity=meta.get("complexity"),
-            model_claude=meta.get("model_claude"),
-        ):
-            errors.append(f"S{sub_n}: {warning}")
+        if check_baseline:
+            for warning in validate_complexity_pair(
+                complexity=meta.get("complexity"),
+                model_claude=meta.get("model_claude"),
+            ):
+                errors.append(f"S{sub_n}: {warning}")
         for warning in validate_subtask_handoff_lines(sub_n, body, position=i, total=total):
             errors.append(f"S{sub_n}: {warning}")
 
@@ -1089,6 +1235,32 @@ def has_explicit_reviewer(fm):
     return isinstance(roles, dict) and roles.get("reviewer") in ("claude", "codex")
 
 
+def review_rounds_cap(fm, override=None):
+    """Review-round cap for a cross-side review loop, or None for no cap.
+    Absent review_rounds_max means no cap, so existing cross-side loops keep
+    running unattended; same-side loops are never capped here."""
+    roles = fm.get("roles") if isinstance(fm.get("roles"), dict) else {}
+    coder, _ = explicit_role_agent(roles, "coder")
+    reviewer, _ = explicit_role_agent(roles, "reviewer")
+    if coder and coder == reviewer:
+        return None
+    value = override if override is not None else fm.get("review_rounds_max")
+    if value is None:
+        return None
+    cap = token_int(value)
+    return cap if cap > 0 else None
+
+
+def append_open_issue(body, text):
+    text = text.strip()
+    if not text.startswith("- "):
+        text = "- " + text
+    existing = (get_section(body, "Open issues") or "").rstrip()
+    if existing.strip() in ("_None._", ""):
+        return set_section(body, "Open issues", f"\n{text}\n")
+    return set_section(body, "Open issues", f"{existing}\n{text}\n")
+
+
 def verify_profile_error(value):
     if not value:
         return None
@@ -1098,12 +1270,28 @@ def verify_profile_error(value):
     return None
 
 
-def validate_runnable_shape(fm, body, target_status=None):
+def validate_runnable_shape(fm, body, target_status=None, check_baseline=True):
     status = target_status or fm.get("status", "")
     if status not in RUNNABLE_STATUS_SET:
         return []
 
     errors = []
+    for field in ("round", "max_seconds"):
+        value = fm.get(field)
+        if value is None:
+            continue
+        try:
+            if isinstance(value, bool):
+                raise ValueError
+            int(value)
+        except (TypeError, ValueError):
+            errors.append(f"{field} must be an integer")
+    roles = fm.get("roles") or {}
+    if isinstance(roles, dict):
+        for role in roles:
+            _, invalid = explicit_role_agent(roles, role)
+            if invalid:
+                errors.append(f"roles.{role} must be claude or codex")
     for key in ("complexity", "kind", "reasoning_effort"):
         if not fm.get(key):
             errors.append(f"missing {key}")
@@ -1113,7 +1301,7 @@ def validate_runnable_shape(fm, body, target_status=None):
         errors.append(profile_error)
 
     scope = get_section(body, "Scope notes") or get_section(body, "Scope") or ""
-    subtask_errors = validate_subtask_block(scope)
+    subtask_errors = validate_subtask_block(scope, check_baseline=check_baseline)
     if subtask_errors:
         errors.extend(f"subtasks: {error}" for error in subtask_errors)
 
@@ -1137,8 +1325,20 @@ def validate_runnable_shape(fm, body, target_status=None):
     return errors
 
 
-def require_runnable_shape(context, fm, body, target_status=None):
-    errors = validate_runnable_shape(fm, body, target_status=target_status)
+def task_baseline_warnings(fm, body):
+    """Task-level plus subtask-level model/effort baseline findings."""
+    warnings = validate_task_level_baseline(fm)
+    scope = get_section(body, "Scope notes") or get_section(body, "Scope") or ""
+    without_baseline = set(validate_subtask_block(scope, check_baseline=False))
+    warnings.extend(
+        warning for warning in validate_subtask_block(scope, check_baseline=True)
+        if warning not in without_baseline
+    )
+    return warnings
+
+
+def require_runnable_shape(context, fm, body, target_status=None, check_baseline=True):
+    errors = validate_runnable_shape(fm, body, target_status=target_status, check_baseline=check_baseline)
     if errors:
         print(f"{context}: runnable task shape is incomplete", file=sys.stderr)
         for error in errors:
@@ -1250,7 +1450,7 @@ def round_role_for(fm, body, assigned):
         roles = {}
     if status == "needs-review" and roles.get("reviewer") == assigned:
         return "reviewer"
-    codex_has_work = section_has_round(get_section(body, "Codex findings") or "", int(fm.get("round", 1) or 1)) or any(
+    codex_has_work = section_has_round(get_section(body, "Codex findings") or "", token_int(fm.get("round", 1)) or 1) or any(
         str(entry).split(":")[1] == "codex" or (len(str(entry).split(":")) > 2 and str(entry).split(":")[2] == "codex")
         for entry in (fm.get("token_log") or [])
     )
@@ -1314,7 +1514,7 @@ def resolve_execution_fields(fm, body, assigned):
 
     def choose_max_seconds():
         if fm.get("max_seconds") is not None:
-            return int(fm["max_seconds"]), "max_seconds"
+            return token_int(fm["max_seconds"]), "max_seconds"
         if role in ("reviewer", "architect"):
             return 1800, "role_default"
         return 1200, "role_default"
@@ -1427,6 +1627,8 @@ def make_token_entry(agent, val, round_n, subtask=None):
             data = {"effective": int(val)}
         except (ValueError, TypeError):
             data = {}
+    if isinstance(data, int):
+        data = {"effective": data}
     inp = token_int(data.get("input", 0))
     out = token_int(data.get("output", 0))
     cr  = token_int(data.get("cache_read", 0))
@@ -1465,9 +1667,10 @@ def parse_token_entry(entry):
         rn = int(parts[0][1:])
     except ValueError:
         return None
-    # parts[1] is the agent name when no stage label is present; otherwise it's
-    # the stage tag (S<n>, review, arch, …) and the agent shifts to parts[2].
-    ai = 1 if (len(parts) > 1 and parts[1] in ("claude", "codex")) else 2
+    # Unstaged entries carry the numeric input field at parts[2]; staged ones
+    # carry the agent there. Older unstaged entries may have extra trailing
+    # fields, so detect the numeric field rather than counting fields.
+    ai = 1 if parts[2].isdigit() else 2
     subtask = parts[1] if ai == 2 else None
     try:
         return {
@@ -1491,7 +1694,8 @@ def parse_token_warning(entry):
         rn = int(parts[0][1:])
     except ValueError:
         return None
-    ai = 1 if (len(parts) > 1 and parts[1] in ("claude", "codex")) else 2
+    # Unstaged warnings have four fields; staged warnings have five.
+    ai = 1 if len(parts) == 4 else 2
     try:
         return {
             "round": rn,
@@ -1616,7 +1820,9 @@ def cmd_show(args):
         return
     fm, body = parse_task(path)
 
-    if args.handoff:
+    if getattr(args, "result", False):
+        print(render_result(path, fm, body))
+    elif args.handoff:
         print(render_handoff(path, fm, body))
     elif args.compact:
         print("---")
@@ -1657,7 +1863,97 @@ def render_handoff(path, fm, body):
             lines.append(f"  net_loc_delta_target: {target}")
         if abort_pct is not None:
             lines.append(f"  abort_if_exceeded_by_pct: {abort_pct}")
-        lines.append("  policy: if your final diff exceeds the band by the configured percentage, ABORT — write findings to `## Findings for follow-up` in the task file and surface to the shaper rather than finishing through.")
+        lines.append("  policy: the band is a warning target, not a stop. If your final diff exceeds it by the configured percentage, finish the subtask, then record actual vs target net LOC and a one-line reason in your finding. A negative band (code-cut/refactor) is a hard reviewer criterion. Only stop if the overshoot comes from work outside the declared scope.")
+    return "\n".join(lines)
+
+
+TERMINAL_FINDING_RE = re.compile(r"\bAPPROVE\b|\bREJECT\b|\breview-passed\b|\breview-failed\b", re.I)
+
+
+def result_finding_blocks(body):
+    blocks = []
+    for section_name, agent in (("Claude findings", "claude"), ("Codex findings", "codex")):
+        section = get_section(body, section_name) or ""
+        for match in re.finditer(r"(?ms)^### Round\s+([0-9]+)\s*\n(.*?)(?=^### Round\s+[0-9]+\s*$|\Z)", section):
+            text = match.group(2).strip()
+            if text and text.lower() not in PLACEHOLDER_SECTION_TEXT:
+                blocks.append({
+                    "round": int(match.group(1)),
+                    "agent": agent,
+                    "text": text,
+                    "terminal": bool(TERMINAL_FINDING_RE.search(text)),
+                })
+    return blocks
+
+
+def latest_result_finding(body):
+    blocks = result_finding_blocks(body)
+    if not blocks:
+        return None
+    terminal = [block for block in blocks if block["terminal"]]
+    candidates = terminal or blocks
+    return max(candidates, key=lambda block: (block["round"], 0 if block["agent"] == "claude" else 1))
+
+
+def final_handoff_content(path, body):
+    scope = get_section(body, "Scope notes") or get_section(body, "Scope") or ""
+    subtasks = parse_subtasks(scope)
+    if not subtasks:
+        return None
+    final_subtask = f"S{max(n for n, _title, _done in subtasks)}"
+    rel = handoff_path_for(path, final_subtask)
+    if not os.path.exists(rel):
+        return None
+    with open(rel, encoding="utf-8") as f:
+        content = f.read().strip()
+    return content or None
+
+
+def result_token_total(token_log):
+    totals = {"input": 0, "output": 0, "cache_read": 0, "effective": 0}
+    found = False
+    for entry in token_log or []:
+        parsed = parse_token_entry(entry)
+        if not parsed:
+            continue
+        found = True
+        totals["input"] += parsed["input"]
+        totals["output"] += parsed["output"]
+        totals["cache_read"] += parsed["cache_read"]
+        totals["effective"] += parsed["effective"]
+    if not found:
+        return None
+    return (
+        f"token_total: effective={totals['effective']} "
+        f"(in={totals['input']} out={totals['output']} cache_read={totals['cache_read']})"
+    )
+
+
+def render_result(path, fm, body):
+    lines = [render_handoff(path, fm, body)]
+
+    finding = latest_result_finding(body)
+    if finding:
+        lines.extend([
+            "",
+            "latest_finding:",
+            f"  agent: {finding['agent']}",
+            f"  round: {finding['round']}",
+            f"  terminal: {'yes' if finding['terminal'] else 'no'}",
+            "  text: |-",
+        ])
+        lines.extend(f"    {line}" for line in finding["text"].splitlines())
+
+    handoff = final_handoff_content(path, body)
+    if handoff:
+        lines.extend(["", "final_handoff:", "```markdown"])
+        lines.extend(handoff.splitlines())
+        lines.append("```")
+
+    token_total = result_token_total(fm.get("token_log") or [])
+    if token_total:
+        lines.extend(["", token_total])
+
     return "\n".join(lines)
 
 # ── list ───────────────────────────────────────────────────────────────────────
@@ -1820,7 +2116,7 @@ def cmd_token_audit(args):
 # ── update ─────────────────────────────────────────────────────────────────────
 
 def cmd_update(args):
-    path = find_task(args.id)
+    path = find_task_exact(args.id)
     if not path:
         print(f"task not found: {args.id}", file=sys.stderr)
         sys.exit(2)
@@ -1829,7 +2125,40 @@ def cmd_update(args):
     prev_status   = fm.get("status", "")
     prev_assigned = fm.get("assigned", "claude")
     prev_hold     = is_pickup_held(fm)
-    round_n = int(fm.get("round", 1))
+    # A forced demote out of done (the worker's close guards) only moves the
+    # task back to a coder: model/effort baseline drift must not block it, so
+    # the baseline is reported as a warning. Structural gates still apply.
+    forced_done_status_only = (
+        args.force
+        and prev_status == "done"
+        and args.status not in (None, "done")
+        and not any(getattr(args, field, None) is not None for field in (
+            "assigned", "agents", "round", "complexity", "model_claude", "model_codex",
+            "model_architect", "model_review", "model_architect_codex",
+            "model_review_codex", "reasoning_effort", "reasoning_effort_architect",
+            "reasoning_effort_review", "roles", "review_rounds_max", "max_turns",
+            "max_seconds", "max_turns_retries_used", "depends_on", "acceptance",
+            "verify_commands", "verify_profile", "scope", "scope_creates", "tags",
+            "release_status", "scope_budget_loc",
+            "scope_budget_abort_pct", "set_plan", "set_acceptance_test", "set_subtasks",
+            "complete_subtask",
+            "add_tokens_claude", "add_tokens_codex", "add_token_warning",
+            "add_runtime_warning", "subtask",
+        ))
+    )
+    # Closing a never-started draft (discard / split parent close) does not
+    # choose a model pair, so the model/effort baseline is not checked.
+    closing_draft = (
+        args.status in ("done", "review-passed")
+        and (prev_status == "shaping"
+             or (prev_status == "needs-brainstorming" and not fm.get("started")))
+        and not any(getattr(args, field, None) is not None for field in (
+            "complexity", "model_claude", "model_architect", "model_review",
+            "reasoning_effort", "reasoning_effort_architect", "reasoning_effort_review",
+            "set_subtasks",
+        ))
+    )
+    round_n = token_int(fm.get("round", 1)) or 1
     commit_tags = []
     _clear_hash_for = None  # set by --status handler; applied just before write_task
     _require_runnable_shape = False
@@ -1871,6 +2200,20 @@ def cmd_update(args):
             else:
                 fm["assigned"] = "codex" if prev_assigned == "claude" else "claude"
             fm.pop(f"content_hash_{fm['assigned']}", None)
+            if prev_status == "needs-review":
+                rejections = token_int(fm.get("review_round")) + 1
+                fm["review_round"] = rejections
+                cap = review_rounds_cap(fm, args.review_rounds_max)
+                if cap is not None and rejections >= cap:
+                    new_status = "needs-brainstorming"
+                    fm["pickup_hold"] = True
+                    body = append_open_issue(
+                        body,
+                        f"review_rounds_max={cap} reached: the reviewer rejected review round "
+                        f"{rejections}; parked on hold instead of another coder round. Raise "
+                        f"review_rounds_max or rescope, then release.",
+                    )
+                    commit_tags.append("review-rounds-max")
 
         err = validate_transition(prev_status, new_status, is_archive_path(path), force=args.force)
         if err and not args.force:
@@ -1912,11 +2255,22 @@ def cmd_update(args):
 
         if args.assigned is None:
             impl = implied_assignee(new_status)
+            if new_status == "needs-review" and prev_status != "needs-review":
+                impl, _ = explicit_role_agent(fm.get("roles"), "reviewer")
             if impl and fm.get("assigned") != impl:
                 fm["assigned"] = impl
 
     # ── --assigned ────────────────────────────────────────────────────────────
     if args.assigned:
+        # An empty allowed list (shaping, needs-brainstorming, done) means the
+        # status does not restrict the assignee.
+        allowed = STATUS_ROUTING.get(fm.get("status", ""), {}).get("allowed", []) or ["claude", "codex"]
+        if args.assigned not in allowed:
+            print(
+                f"update: assigned '{args.assigned}' is not allowed for status '{fm.get('status', '')}'",
+                file=sys.stderr,
+            )
+            sys.exit(3)
         fm["assigned"] = args.assigned
         commit_tags.append(f"assigned={args.assigned}")
 
@@ -1930,7 +2284,7 @@ def cmd_update(args):
     # ── --round ───────────────────────────────────────────────────────────────
     if args.round is not None:
         n = args.round
-        prev_round = int(fm.get("round", 1))
+        prev_round = token_int(fm.get("round", 1)) or 1
         fm["round"] = n
         round_n = n
         if n > prev_round:
@@ -1945,6 +2299,14 @@ def cmd_update(args):
             else:
                 fm[attr] = val
             commit_tags.append(f"{attr}={val}")
+
+    if args.complexity is not None:
+        if args.complexity not in COMPLEXITY_MODEL_BASELINE:
+            print(f"update: invalid complexity '{args.complexity}'; use one of: "
+                  f"{', '.join(COMPLEXITY_MODEL_BASELINE)}", file=sys.stderr)
+            sys.exit(3)
+        fm["complexity"] = args.complexity
+        commit_tags.append(f"complexity={args.complexity}")
 
     # ── Reasoning fields ──────────────────────────────────────────────────────
     for attr in ("reasoning_effort", "reasoning_effort_architect", "reasoning_effort_review"):
@@ -2028,6 +2390,13 @@ def cmd_update(args):
         else:
             fm.pop("scope_creates", None)
 
+    if getattr(args, "tags", None) is not None:
+        tags = list(dict.fromkeys(as_list(args.tags)))
+        if tags:
+            fm["tags"] = tags
+        else:
+            fm.pop("tags", None)
+
     sb_loc = getattr(args, "scope_budget_loc", None)
     sb_abort = getattr(args, "scope_budget_abort_pct", None)
     if sb_loc is not None or sb_abort is not None:
@@ -2076,15 +2445,7 @@ def cmd_update(args):
 
     # ── --add-issues ──────────────────────────────────────────────────────────
     if args.add_issues:
-        text = resolve(args.add_issues).strip()
-        if not text.startswith("- "):
-            text = "- " + text
-        existing = (get_section(body, "Open issues") or "").rstrip()
-        if existing.strip() in ("_None._", ""):
-            new_content = f"\n{text}\n"
-        else:
-            new_content = f"{existing}\n{text}\n"
-        body = set_section(body, "Open issues", new_content)
+        body = append_open_issue(body, resolve(args.add_issues))
 
     # ── --set-plan ────────────────────────────────────────────────────────────
     if args.set_plan:
@@ -2102,10 +2463,16 @@ def cmd_update(args):
         scope = get_section(body, scope_name) or ""
         # Replace existing subtask block if present, else append.
         # Completed subtasks are still part of the executable checklist.
-        existing_m = re.search(r"(?m)^- \[[ x]\] \*\*S\d+:", scope)
-        if existing_m:
-            prefix = strip_leaked_subtask_file_paths(scope[:existing_m.start()])
+        subtask_matches = list(re.finditer(
+            r"(?m)^- \[[ x]\] \*\*S\d+:.*(?:\n(?:[ \t].*|$))*", scope
+        ))
+        if subtask_matches:
+            first, last = subtask_matches[0], subtask_matches[-1]
+            prefix = strip_leaked_subtask_file_paths(scope[:first.start()]).rstrip()
+            suffix = scope[last.end():].lstrip("\n")
             new_scope = (prefix + "\n\n" if prefix else "") + subtask_text
+            if suffix:
+                new_scope += "\n\n" + suffix
         else:
             prefix = strip_leaked_subtask_file_paths(scope)
             new_scope = (prefix + "\n\n" if prefix else "") + subtask_text
@@ -2118,6 +2485,13 @@ def cmd_update(args):
             text = resolve(val).strip()
             sec_name = f"{agent.capitalize()} findings"
             existing = get_section(body, sec_name) or ""
+            # Re-appending the identical finding for the current round (a
+            # retried update) is a no-op rather than a new round.
+            pattern = rf"### Round {round_n}\s*\n(.*?)(?=### Round |\Z)"
+            current = re.search(pattern, existing, re.DOTALL)
+            if current and current.group(1).strip() == text:
+                fm[f"content_hash_{agent}"] = content_hash(fm, body)
+                continue
             # Auto-advance round if this round already has content
             if section_has_round(existing, round_n):
                 round_n += 1
@@ -2134,12 +2508,17 @@ def cmd_update(args):
         if val:
             entry = make_token_entry(agent, val, round_n, getattr(args, "subtask", None))
             token_log = list(fm.get("token_log") or [])
+            parsed_entry = parse_token_entry(entry)
+            if any(parse_token_entry(existing) == parsed_entry for existing in token_log):
+                continue
             token_log.append(entry)
             fm["token_log"] = token_log
             try:
                 data = json.loads(val)
             except (json.JSONDecodeError, TypeError):
                 data = {}
+            if isinstance(data, int):
+                data = {"effective": data}
             warning_codes = []
             if isinstance(data, dict):
                 raw_warnings = data.get("warnings") or data.get("token_warnings") or []
@@ -2184,14 +2563,22 @@ def cmd_update(args):
         fm.pop(f"content_hash_{_clear_hash_for}", None)
 
     if _require_runnable_shape and runnable_for(fm.get("status", "")) and not is_pickup_held(fm):
-        require_runnable_shape("update", fm, body, target_status=fm.get("status", ""))
+        require_runnable_shape("update", fm, body, target_status=fm.get("status", ""),
+                               check_baseline=not forced_done_status_only)
 
-    baseline_warnings = validate_task_level_baseline(fm)
+    if closing_draft:
+        baseline_warnings = []
+    elif forced_done_status_only:
+        baseline_warnings = task_baseline_warnings(fm, body)
+    else:
+        baseline_warnings = validate_task_level_baseline(fm)
     if baseline_warnings:
-        print("update: task frontmatter off-baseline", file=sys.stderr)
+        warning_label = " (warning only for forced demote)" if forced_done_status_only else ""
+        print(f"update: task frontmatter off-baseline{warning_label}", file=sys.stderr)
         for warning in baseline_warnings:
             print(f"  - {warning}", file=sys.stderr)
-        sys.exit(3)
+        if not forced_done_status_only:
+            sys.exit(3)
     advisories = advisory_simple_high(fm)
     if advisories:
         print("update: shaping advisory (non-fatal)", file=sys.stderr)
@@ -2220,9 +2607,9 @@ def cmd_update(args):
     msg = f"coord: update {task_id}"
     if commit_tags:
         msg += " " + " ".join(commit_tags)
-    if old_path:
-        git("rm", "--cached", "--ignore-unmatch", old_path)
-    commit_and_push(path, msg)
+    if not commit_and_push_paths([path, old_path] if old_path else [path], msg):
+        print("update: git side effect failed", file=sys.stderr)
+        sys.exit(4)
     print(f"updated {task_id}")
 
 # ── new ────────────────────────────────────────────────────────────────────────
@@ -2238,11 +2625,29 @@ def cmd_new(args):
     if args.overnight:
         print("new: --overnight is deprecated; use --hold plus coord release for unattended batches", file=sys.stderr)
 
+    roles = None
+    if args.roles:
+        roles = {}
+        for pair in args.roles.split(","):
+            if ":" in pair:
+                r, a = pair.split(":", 1)
+                roles[r.strip()] = a.strip()
+
     # Unique ID check
-    if find_task(task_id):
-        task_id = f"{task_id}-2"
+    suffix = 2
+    paths = configured_paths()
+    while find_task_exact(task_id) or any(
+        os.path.exists(path)
+        for base in paths["active_read_dirs"] + paths["archive_read_dirs"]
+        if (path := task_path_in_base(base, task_id))
+    ):
+        task_id = f"{date_str}-{slug}-{suffix}"
+        suffix += 1
 
     initial_status = args.status or "shaping"
+    if initial_status not in {"shaping", "needs-brainstorming", "pending", "needs-review"}:
+        print(f"new: invalid initial status '{initial_status}'", file=sys.stderr)
+        sys.exit(3)
 
     # Assigned resolution
     assigned = args.assigned
@@ -2251,13 +2656,10 @@ def cmd_new(args):
             assigned = "codex"
         elif args.agents and args.agents != "multi":
             assigned = args.agents
-        elif args.roles:
-            for pair in args.roles.split(","):
-                if ":" in pair:
-                    role, agent = pair.split(":", 1)
-                    if role.strip() == "architect":
-                        assigned = agent.strip()
-                        break
+        elif roles:
+            architect, _ = explicit_role_agent(roles, "architect")
+            if architect:
+                assigned = architect
         if not assigned and args.kind:
             kind_codex = {"code-fix", "code-cut", "refactor", "smoke-test"}
             kind_codex |= {"design", "sql-diagnostic", "review"}
@@ -2265,6 +2667,15 @@ def cmd_new(args):
                 assigned = "codex"
         if not assigned:
             assigned = "codex"
+
+    if args.assigned:
+        allowed = STATUS_ROUTING[initial_status]["allowed"] or ["claude", "codex"]
+        if assigned not in allowed:
+            print(
+                f"new: assigned '{assigned}' is not allowed for status '{initial_status}'",
+                file=sys.stderr,
+            )
+            sys.exit(3)
 
     fm = {}
     fm["id"] = task_id
@@ -2293,12 +2704,7 @@ def cmd_new(args):
     if getattr(args, "reasoning_effort_review", None):
         fm["reasoning_effort_review"] = args.reasoning_effort_review
 
-    if args.roles:
-        roles = {}
-        for pair in args.roles.split(","):
-            if ":" in pair:
-                r, a = pair.split(":", 1)
-                roles[r.strip()] = a.strip()
+    if roles:
         fm["roles"] = roles
 
     if args.review_rounds_max is not None:
@@ -2332,6 +2738,8 @@ def cmd_new(args):
     tags = ["coordination"]
     if args.overnight:
         tags.append("overnight")
+    tags.extend(as_list(args.tags))
+    tags = list(dict.fromkeys(tags))
     fm["tags"] = tags
     fm["priority"] = args.priority or 5
     _default_turns = 12 if args.complexity in ("complex", "xhigh") else 4
@@ -2411,16 +2819,18 @@ def cmd_new(args):
     if runnable_for(initial_status) and not is_pickup_held(fm):
         require_runnable_shape("new", fm, body, target_status=initial_status)
 
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "x", encoding="utf-8") as f:
         f.write(content)
 
-    commit_and_push(path, f"coord: new {task_id}")
+    if not commit_and_push(path, f"coord: new {task_id}"):
+        print("new: git side effect failed", file=sys.stderr)
+        sys.exit(4)
     print(task_id)
 
 # ── promote ────────────────────────────────────────────────────────────────────
 
 def cmd_promote(args):
-    path = find_task(args.id)
+    path = find_task_exact(args.id)
     if not path:
         print(f"task not found: {args.id}", file=sys.stderr)
         sys.exit(2)
@@ -2435,6 +2845,11 @@ def cmd_promote(args):
     if not runnable_for(target):
         print(f"promote: target status '{target}' is not runnable", file=sys.stderr)
         sys.exit(3)
+    if args.status:
+        err = validate_transition(current, target, is_archive_path(path))
+        if err:
+            print(f"promote: {err}", file=sys.stderr)
+            sys.exit(3)
     candidate = dict(fm)
     candidate["status"] = target
     candidate.pop("pickup_hold", None)
@@ -2449,7 +2864,9 @@ def cmd_promote(args):
     write_task(path, fm, body)
 
     task_id = fm.get("id", args.id)
-    commit_and_push(path, f"coord: promote {task_id} → {target}")
+    if not commit_and_push(path, f"coord: promote {task_id} → {target}"):
+        print("promote: git side effect failed", file=sys.stderr)
+        sys.exit(4)
     print(f"promoted {task_id} → {target}")
 
 # ── release ────────────────────────────────────────────────────────────────────
@@ -2465,7 +2882,7 @@ def cmd_release(args):
             print("release: pass at least one id or --all-held", file=sys.stderr)
             sys.exit(1)
         for task_id in args.ids:
-            path = find_task(task_id)
+            path = find_task_exact(task_id)
             if not path:
                 print(f"task not found: {task_id}", file=sys.stderr)
                 sys.exit(2)
@@ -2477,6 +2894,7 @@ def cmd_release(args):
         return
 
     release_plan = []
+    baseline_warnings = []
     validation_errors = []
     for path, fm, body in selected:
         task_id = fm.get("id", os.path.splitext(os.path.basename(path))[0])
@@ -2490,12 +2908,23 @@ def cmd_release(args):
             else:
                 validation_errors.append((task_id, f"release target '{target}' is not runnable"))
                 continue
+        if args.status:
+            err = validate_transition(fm.get("status", ""), target, is_archive_path(path))
+            if err:
+                validation_errors.append((task_id, err))
+                continue
         candidate = dict(fm)
         candidate["status"] = target
         candidate.pop("pickup_hold", None)
         candidate.pop("release_status", None)
-        errors = validate_runnable_shape(candidate, body, target_status=target)
+        # Releasing a held task must not be blocked by model/effort baseline
+        # drift since it was shaped: report the baseline, gate on structure.
+        errors = validate_runnable_shape(candidate, body, target_status=target, check_baseline=False)
         validation_errors.extend((task_id, error) for error in errors)
+        baseline_warnings.extend(
+            (task_id, warning)
+            for warning in task_baseline_warnings(candidate, body)
+        )
         release_plan.append((path, fm, body, target, task_id))
 
     if validation_errors:
@@ -2503,6 +2932,11 @@ def cmd_release(args):
         for task_id, error in validation_errors:
             print(f"  - {task_id}: {error}", file=sys.stderr)
         sys.exit(3)
+
+    if baseline_warnings:
+        print("release: task frontmatter off-baseline (warning only for release)", file=sys.stderr)
+        for task_id, warning in baseline_warnings:
+            print(f"  - {task_id}: {warning}", file=sys.stderr)
 
     changed_paths = []
     released_ids = []
@@ -2515,7 +2949,9 @@ def cmd_release(args):
         changed_paths.append(path)
         released_ids.append(task_id)
 
-    commit_and_push_paths(changed_paths, f"coord: release {' '.join(released_ids)}")
+    if not commit_and_push_paths(changed_paths, f"coord: release {' '.join(released_ids)}"):
+        print("release: git side effect failed", file=sys.stderr)
+        sys.exit(4)
     print(f"released {len(released_ids)} task(s): {', '.join(released_ids)}")
 
 # ── precheck ───────────────────────────────────────────────────────────────────
@@ -2605,7 +3041,7 @@ def cmd_pickup(args):
 # ── next-subtask ───────────────────────────────────────────────────────────────
 
 def cmd_next_subtask(args):
-    path = find_task(args.id)
+    path = find_task_exact(args.id)
     if not path:
         print(f"task not found: {args.id}", file=sys.stderr)
         sys.exit(2)
@@ -2647,6 +3083,7 @@ def build_parser():
     s.add_argument("id")
     s.add_argument("--compact", action="store_true")
     s.add_argument("--handoff", action="store_true")
+    s.add_argument("--result", action="store_true")
     s.add_argument("--path", action="store_true")
     s.add_argument("--journal", nargs="?", const=20, type=int)
 
@@ -2673,6 +3110,7 @@ def build_parser():
     s.add_argument("--max-seconds", "--max_seconds", type=int, dest="max_seconds",
                    help="wall-clock budget per round in seconds (overrides role default: coder=1200, reviewer/architect=1800)")
     s.add_argument("--max-turns-retries-used", "--max_turns_retries_used", type=int, dest="max_turns_retries_used")
+    s.add_argument("--complexity")
     s.add_argument("--model_claude", "--model-claude")
     s.add_argument("--model_codex", "--model-codex")
     s.add_argument("--model_architect", "--model-architect")
@@ -2688,13 +3126,14 @@ def build_parser():
     s.add_argument("--verify-profile", "--verify_profile", dest="verify_profile")
     s.add_argument("--scope")
     s.add_argument("--scope-creates", "--scope_creates", dest="scope_creates")
+    s.add_argument("--tags")
     s.add_argument("--pickup-hold", "--pickup_hold", dest="pickup_hold", nargs="?", const="true")
     s.add_argument("--release-status", "--release_status", dest="release_status")
     s.add_argument("--add-issues")
     s.add_argument("--scope-budget-loc", "--scope_budget_loc", dest="scope_budget_loc",
-                   help="net LOC delta band for this task, e.g. '-800 to -1200' or '+50 to +200'. Written to frontmatter scope_budget.net_loc_delta_target and surfaced in handoff/pickup; advisory only — implementer prompt aborts and surfaces when diff exceeds the band by the configured percentage.")
+                   help="net LOC delta band for this task, e.g. '-800 to -1200' or '+50 to +200'. Written to frontmatter scope_budget.net_loc_delta_target and surfaced in handoff/pickup; advisory only — an overshoot beyond the configured percentage is recorded for the reviewer, not a stop.")
     s.add_argument("--scope-budget-abort-pct", "--scope_budget_abort_pct", dest="scope_budget_abort_pct", type=int,
-                   help="percentage above the upper bound at which the implementer should abort and surface findings instead of finishing. Default 50 when --scope-budget-loc is set without this flag.")
+                   help="percentage above the upper bound at which the implementer must record actual-vs-target net LOC and a reason in its finding for the reviewer (warning target, not a stop). Default 50 when --scope-budget-loc is set without this flag.")
     s.add_argument("--set-plan")
     s.add_argument("--set-acceptance-test")
     s.add_argument("--set-subtasks")

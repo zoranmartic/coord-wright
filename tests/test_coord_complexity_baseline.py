@@ -17,6 +17,8 @@ import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 COORD = ROOT / "bin" / "coord"
@@ -359,3 +361,131 @@ class CoordUpdateBaselineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_forced_done_demote_with_worker_args_warns_for_task_and_subtask_baselines(coord_repo):
+    path = coord_repo.tasks["done"]
+    task_id = "sample-done"
+    path.write_text(path.read_text().replace(
+        "reasoning_effort: medium", "reasoning_effort: medium\nmodel_claude: opus"
+    ).replace("  model_claude: sonnet", "  model_claude: opus"))
+
+    result = coord_repo.coord(
+        "update", task_id, "--status=review-failed", "--force",
+        "--add-issues=worker mechanical verify gate failed",
+        "--append-codex-finding=Mechanical gate failed.",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "off-baseline" in result.stderr
+    assert "warning only for forced demote" in result.stderr
+    assert "S1:" in result.stderr
+    active = coord_repo.root / "tasks" / f"{task_id}.md"
+    assert active.exists()
+    assert "status: pending" in active.read_text()
+
+
+def test_unforced_update_still_rejects_off_baseline_task(coord_repo):
+    path = coord_repo.tasks["pending"]
+    path.write_text(path.read_text().replace(
+        "reasoning_effort: medium", "reasoning_effort: medium\nmodel_claude: opus"
+    ))
+
+    result = coord_repo.coord("update", "sample-pending", "--add-issues=note")
+
+    assert result.returncode == 3
+    assert "off-baseline" in result.stderr
+    assert "warning only" not in result.stderr
+
+
+def test_release_warns_for_task_and_subtask_baselines(coord_repo):
+    path = coord_repo.tasks["pending"]
+    task_id = "sample-pending"
+    text = path.read_text().replace(
+        "reasoning_effort: medium", "reasoning_effort: medium\nmodel_claude: opus"
+    )
+    path.write_text(text.replace("  model_claude: sonnet", "  model_claude: opus").replace(
+        "round: 1", "pickup_hold: true\nround: 1"
+    ))
+
+    result = coord_repo.coord("release", task_id)
+
+    assert result.returncode == 0, result.stderr
+    assert "off-baseline" in result.stderr
+    assert "warning only for release" in result.stderr
+    assert "S1:" in result.stderr
+    released = path.read_text()
+    assert "pickup_hold: true" not in released
+    assert "status: pending" in released
+
+
+def test_release_still_rejects_structurally_incomplete_task(coord_repo):
+    path = coord_repo.tasks["pending"]
+    text = path.read_text().replace("  complexity: simple\n", "", 1)
+    path.write_text(text.replace("round: 1", "pickup_hold: true\nround: 1"))
+
+    result = coord_repo.coord("release", "sample-pending")
+
+    assert result.returncode == 3
+    assert "runnable task shape is incomplete" in result.stderr
+
+
+def _pending_complex_opus(coord_repo):
+    path = coord_repo.tasks["pending"]
+    path.write_text(path.read_text().replace("complexity: simple", "complexity: complex", 1).replace(
+        "reasoning_effort: medium", "reasoning_effort: medium\nmodel_claude: opus\nmodel_codex: gpt-5.6-sol"
+    ))
+    return path
+
+
+def test_update_complexity_swaps_to_a_cheaper_pair_in_one_call(coord_repo):
+    path = _pending_complex_opus(coord_repo)
+
+    result = coord_repo.coord("update", "sample-pending", "--complexity=simple", "--model_claude=sonnet")
+
+    assert result.returncode == 0, result.stderr
+    text = path.read_text()
+    assert "complexity: simple\n" in text
+    assert "model_claude: sonnet\n" in text
+    assert "model_codex: gpt-5.6-sol\n" in text
+
+
+@pytest.mark.parametrize("flags,expected", [
+    (("--model_claude=haiku",), "off-baseline"),
+    (("--complexity=simple",), "off-baseline"),
+    (("--complexity=huge",), "invalid complexity 'huge'"),
+])
+def test_update_complexity_is_validated_against_the_resulting_pair(coord_repo, flags, expected):
+    path = _pending_complex_opus(coord_repo)
+    before = path.read_text()
+
+    result = coord_repo.coord("update", "sample-pending", *flags)
+
+    assert result.returncode == 3
+    assert expected in result.stderr
+    assert path.read_text() == before
+
+
+@pytest.mark.parametrize("status", ["shaping", "needs-brainstorming"])
+def test_forced_close_of_never_started_draft_skips_the_baseline(coord_repo, status):
+    path = coord_repo.tasks[status]
+    path.write_text(path.read_text().replace("reasoning_effort: medium", "reasoning_effort: medium\nmodel_claude: opus"))
+
+    result = coord_repo.coord("update", f"sample-{status}", "--status=done", "--force", "--add-issues=Discarded: superseded.")
+
+    assert result.returncode == 0, result.stderr
+    assert not path.exists()
+    assert "status: done" in (coord_repo.root / "tasks" / "archive" / path.name).read_text()
+
+
+def test_forced_close_of_started_draft_keeps_the_baseline(coord_repo):
+    path = coord_repo.tasks["needs-brainstorming"]
+    path.write_text(path.read_text().replace(
+        "reasoning_effort: medium", "reasoning_effort: medium\nmodel_claude: opus\nstarted: 2026-05-17T00:00:00+0100"
+    ))
+
+    result = coord_repo.coord("update", "sample-needs-brainstorming", "--status=done", "--force")
+
+    assert result.returncode == 3
+    assert "off-baseline" in result.stderr
+    assert path.exists()

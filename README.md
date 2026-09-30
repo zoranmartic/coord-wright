@@ -85,9 +85,11 @@ cd ~/Projects/coord-wright
 ./install.sh
 ```
 
-`install.sh` symlinks the skills, agents, and commands into `~/.claude/` and `~/.agents/`, merges the Claude Code permission settings (resolving paths to your machine). For each repo listed in `projects.txt` it installs a `launchd` worker and adjusts that repo's `.gitignore` / git-exclude for coord's runtime files. **It modifies the repositories you register, so read it before running.** Idempotent; re-run after editing `projects.txt`.
+`install.sh` symlinks the skills and commands into `~/.claude/` and `~/.agents/`, merges the Claude Code permission settings (resolving paths to your machine). For each repo listed in `projects.txt` it installs a `launchd` worker and adjusts that repo's `.gitignore` / git-exclude for coord's runtime files. **It modifies the repositories you register, so read it before running.** Idempotent; re-run after editing `projects.txt`.
 
 If you clone somewhere other than `~/Projects/coord-wright`, set `COORD_TOOLS` to your checkout path (e.g. in your shell profile) so the `coord-*` skills resolve.
+
+Timestamps in task frontmatter and worker logs are ISO 8601 with a numeric offset in the system local timezone. Set `COORD_TZ` to an IANA name (e.g. `COORD_TZ=America/New_York`) in your shell profile, and in `<project>/.coord/config.env` for the worker, to pin a different one.
 
 `./uninstall.sh` reverses it: unloads the launchd workers and removes the symlinks (the merged settings are left for you to review by hand).
 
@@ -111,7 +113,7 @@ COORD_UNSAFE_AUTONOMOUS=1 ./install.sh
 
 The `/coord-*` skills (`coord-shape`, `coord-check`, `coord-status`, `coord-promote`, and friends) are the interface; the `coord` CLI underneath does the bookkeeping. Per-project worker config goes in `<project>/.coord/config.env` — see [`templates/config.example.env`](templates/config.example.env). Without the `COORD_UNSAFE_AUTONOMOUS=1` acknowledgement everything except unattended worker rounds still works — shape, promote, and review from your own sessions, or run a task in the foreground with `/coord-run`.
 
-A git remote is optional; without one coord commits locally and skips the push. A push that *fails* (rejected, no credentials) is a loud non-zero error — coord never reports a queue write as done when it didn't land. The worker is silent while idle (`.coord/worker.log` records one line saying rounds are disabled if the acknowledgement is missing); `launchctl list | grep com.coord.worker` confirms it is loaded.
+A git remote is optional; without one coord commits locally and skips the push. A push that *fails* (still rejected after one `pull --rebase --autostash` retry, no credentials) is a loud non-zero error (exit 4) — coord never reports a queue write as done when it didn't land. The worker is silent while idle (`.coord/worker.log` records one line saying rounds are disabled if the acknowledgement is missing); `launchctl list | grep com.coord.worker` confirms it is loaded. `bin/coord-log <project>` follows a compact one-line-per-round view of that log (`--once` prints recent history and exits).
 
 ## What this is — and isn't
 
@@ -124,8 +126,11 @@ A git remote is optional; without one coord commits locally and skips the push. 
 bin/        the `coord` CLI and helpers
 worker/     launchd worker, watchdog, semaphore, rate-limit
 skills/     the /coord-* Claude Code skills (the operator interface)
+commands/   /coord-run and /codex slash commands
 hooks/      pre/post tool-use safety + session-start hooks
-agents/     architect / coder / reviewer role definitions
+settings/   Claude Code permission settings merged by install.sh
+templates/  per-project config.env and task templates
+tasks/      an example shaped task
 docs/       the coordination protocol + the workflow-discipline policy
 tests/      the test suite (run: python3 -m pytest tests/)
 ```

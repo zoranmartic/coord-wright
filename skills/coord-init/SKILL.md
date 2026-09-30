@@ -11,15 +11,7 @@ Project-root preflight:
   `COORD_MAIN=$("${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord-project-root") && cd "$COORD_MAIN"`
 - This is required when the skill is invoked from a sibling task worktree; project bootstrap policy belongs in the main checkout.
 
-**Before you ask anything:** scan the repo root for signals:
-- Top-level directories (`ls` the project root)
-- `package.json` → framework, test runner, e2e tools
-- `pyproject.toml` / `requirements.txt` / `setup.py` → Python stack
-- `pom.xml` / `build.gradle` → Java stack
-- `Makefile` → build/test targets
-- `alembic/` or `migrations/` → database migrations present
-- `Dockerfile` / `docker-compose.yml` → containerized services
-- Notable domain signals: `ibapi`, `stripe`, `twilio`, broker/trading deps, etc.
+**Before you ask anything:** scan the repo root for signals: top-level directories, language/build manifests and test targets, migration directories, container files, and notable domain dependencies (broker, payment, messaging SDKs).
 
 Use those signals to **prefill your proposed answers** so the user only confirms or corrects — never ask an open "tell me about your project" prompt.
 
@@ -27,7 +19,7 @@ Use those signals to **prefill your proposed answers** so the user only confirms
 
 ## Q1 — What This Repo Is
 
-State what you detected, then propose one paragraph. Example format:
+State what you detected, then propose one paragraph. The example below is illustrative (a trading project); match the shape, not the content:
 
 > "I see: FastAPI backend with `ibapi` (IBKR trading), Alembic migrations, Postgres, React frontend with Playwright, a `worker/` process, and a `demo/` directory.
 >
@@ -41,7 +33,7 @@ Wait for the user's answer. Record their final paragraph as the "What This Repo 
 
 ## Q2 — Repo Map
 
-List the top-level directories you found (excluding hidden dirs, `node_modules`, `__pycache__`, dist/build dirs). Propose one bullet per directory with a short description inferred from its contents. Example:
+List the top-level directories you found (excluding hidden dirs, `node_modules`, `__pycache__`, dist/build dirs). Propose one bullet per directory with a short description inferred from its contents. Illustrative example:
 
 > "Proposed Repo Map:
 > - `backend/` — FastAPI app, Alembic migrations, unit tests
@@ -65,7 +57,7 @@ Propose the validation commands based on what you detected:
 - Makefile with test target → `make test`
 - Healthz endpoint pattern detected → include `curl --fail <url>`
 
-Example:
+Illustrative example:
 
 > "Proposed Validation:
 > - Backend: `cd backend && pytest`

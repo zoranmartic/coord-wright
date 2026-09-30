@@ -264,6 +264,18 @@ class CoordTokenTests(unittest.TestCase):
         self.assertIn("assigned: claude", text)
         self.assertIn("architect: claude", text)
 
+    def test_new_skipped_architect_role_uses_default_assignee(self):
+        result = self.run_coord(
+            "new",
+            "--task=Skipped architect defaults to coder",
+            "--complexity=simple",
+            "--roles=architect:skip,coder:codex,reviewer:claude",
+        )
+        task_id = result.stdout.strip().splitlines()[-1]
+        path = next((self.root / "tasks").glob(f"{task_id}.md"))
+
+        self.assertIn("assigned: codex", path.read_text(encoding="utf-8"))
+
     def test_new_rejects_runnable_task_without_subtasks(self):
         result = self.run_coord_raw(
             "new",
@@ -475,6 +487,67 @@ class CoordTokenTests(unittest.TestCase):
         # Table format: (round=1, subtask="", agent=codex, input=12, output=5, cache_read=3, effective=17)
         self.assertRegex(text, r"\|\s*1\s*\|\s*\|\s*codex\s*\|\s*12\s*\|\s*5\s*\|\s*3\s*\|\s*17\s*\|")
 
+    def test_add_tokens_accepts_plain_integer(self):
+        path = self.write_task("2026-05-09-integer-tokens")
+
+        self.run_coord("update", "2026-05-09-integer-tokens", "--add-tokens-codex=17")
+
+        self.assertIn("R1:codex:0:0:0:17:", path.read_text(encoding="utf-8"))
+
+    def test_unknown_agent_warning_renders_without_stage(self):
+        path = self.write_task("2026-05-09-unknown-warning")
+
+        self.run_coord(
+            "update", "2026-05-09-unknown-warning", "--add-token-warning=missing-usage"
+        )
+
+        self.assertIn("R1 unknown: usage data missing", path.read_text(encoding="utf-8"))
+
+    def test_identical_token_entry_is_not_added_twice(self):
+        path = self.write_task("2026-05-09-deduplicated-tokens")
+        payload = json.dumps({"input": 12, "output": 5, "cache_read": 3, "effective": 17})
+
+        for _ in range(2):
+            self.run_coord("update", "2026-05-09-deduplicated-tokens", f"--add-tokens-codex={payload}")
+
+        self.assertEqual(path.read_text(encoding="utf-8").count("R1:codex:12:5:3:17:"), 1)
+
+    def test_identical_finding_does_not_advance_round(self):
+        path = self.write_task("2026-05-09-deduplicated-finding")
+
+        for _ in range(2):
+            self.run_coord("update", "2026-05-09-deduplicated-finding", "--append-codex-finding=Done.")
+
+        text = path.read_text(encoding="utf-8")
+        self.assertEqual(text.count("### Round 1"), 1)
+        self.assertNotIn("### Round 2", text)
+
+    def test_identical_finding_refreshes_content_hash_after_other_edits(self):
+        self.write_task("2026-05-09-finding-hash-refresh")
+
+        self.run_coord("update", "2026-05-09-finding-hash-refresh", "--append-codex-finding=Blocked: X")
+        self.run_coord("update", "2026-05-09-finding-hash-refresh", "--set-plan=Human changed the plan.")
+        self.run_coord("update", "2026-05-09-finding-hash-refresh", "--append-codex-finding=Blocked: X")
+
+        result = self.run_coord_raw("pickup", "--assigned=codex")
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(json.loads(result.stdout)["decision"], "skip")
+
+    def test_legacy_unstaged_token_entries_keep_effective_total(self):
+        self.write_task(
+            "2026-05-09-legacy-token-entries",
+            frontmatter=(
+                "token_log:\n"
+                "  - R1:claude:24:53756:101:53881:1776544012:739\n"
+                "  - R2:codex:12:34:56:102:1776544013:extra:fields"
+            ),
+        )
+
+        result = self.run_coord_raw("show", "2026-05-09-legacy-token-entries", "--result")
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("token_total: effective=53983", result.stdout)
+
     def test_add_tokens_codex_without_remote_updates_task(self):
         subprocess.run(["git", "remote", "remove", "origin"], cwd=self.root, check=True, capture_output=True)
         path = self.write_task("2026-05-09-no-remote-tokens")
@@ -638,6 +711,28 @@ class CoordTokenTests(unittest.TestCase):
         # Effective via worker.sh codex GPT-5.5 formula:
         # 9023 + 6*481 + 11648//10 = 13073
         self.assertIn("R1:S1:codex:9023:481:11648:13073:", text)
+
+    def test_worker_stage_selection_prioritizes_role(self):
+        worker = (ROOT / "worker" / "worker.sh").read_text()
+        start = worker.index('STAGE_LABEL="${CURRENT_SUBTASK:-}"')
+        script = worker[start:worker.index("RUNTIME_WARNING_CODES=", start)]
+        cases = [
+            ("reviewer", "", "needs-review", "review"),
+            ("reviewer", "S4", "needs-review", "review"),
+            ("architect", "", "pending", "arch"),
+            ("coder", "S1", "pending", "S1"),
+            ("coder", "", "pending", "code"),
+            ("coder", "", "needs-review", "fix"),
+        ]
+        for role, subtask, status, expected in cases:
+            with self.subTest(role=role, subtask=subtask, status=status):
+                result = subprocess.run(
+                    ["bash", "-c", script + '\nprintf "%s" "$STAGE_LABEL"'],
+                    env={**os.environ, "ROUND_ROLE": role,
+                         "CURRENT_SUBTASK": subtask, "ORIG_STATUS": status},
+                    text=True, capture_output=True, check=True,
+                )
+                self.assertEqual(result.stdout, expected)
 
     def test_archived_task_can_receive_token_warning(self):
         path = self.write_task(
@@ -1528,6 +1623,70 @@ class CoordTokensShellTests(unittest.TestCase):
         self.assertIn("5h", text)
         self.assertIn("4% used", text)
         self.assertIn("week", text)
+
+    def test_codex_round_summary_uses_latest_cumulative_usage_and_real_calls(self):
+        events = [
+            {"type": "session_meta", "timestamp": "2026-09-05T10:00:00Z",
+             "payload": {"id": "trial", "cwd": "/tmp/trial", "cli_version": "0.153.4"}},
+            {"type": "turn_context", "payload": {"cwd": "/tmp/trial", "model": "gpt-5.6-sol", "effort": "medium"}},
+            self.token_event(input_tokens=100, cached_input_tokens=20, output_tokens=10),
+            {"type": "response_item", "payload": {"type": "function_call", "call_id": "a", "name": "exec_command"}},
+            {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "a",
+             "output": '{"type":"function_call"}'}},
+            {"type": "response_item", "payload": {"type": "custom_tool_call", "call_id": "b", "name": "apply_patch"}},
+            {"type": "event_msg", "timestamp": "2026-09-05T10:01:00Z", "payload": {
+                "type": "token_count", "info": {
+                    "total_token_usage": {"input_tokens": 1000, "cached_input_tokens": 600,
+                                          "output_tokens": 40, "reasoning_output_tokens": 15},
+                    "last_token_usage": {"input_tokens": 900, "output_tokens": 30}}}},
+            {"type": "event_msg", "timestamp": "2026-09-05T10:01:02Z", "payload": {"type": "token_count", "info": None}},
+        ]
+        rollout = self.write_rollout("round-summary.jsonl", events)
+        result = subprocess.run(
+            ["node", str(ROOT / "bin/codex-coord-stats.js"), "--round-summary", "--expect-cwd", "/tmp/trial", str(rollout)],
+            text=True, capture_output=True, check=True,
+        )
+        self.assertEqual(json.loads(result.stdout), {
+            "session_id": "trial", "cwd": "/tmp/trial", "cli_version": "0.153.4",
+            "model": "gpt-5.6-sol", "reasoning_effort": "medium",
+            "first_timestamp": "2026-09-05T10:00:00Z", "last_timestamp": "2026-09-05T10:01:02Z",
+            "input_tokens": 1000, "cached_input_tokens": 600, "uncached_input_tokens": 400,
+            "output_tokens": 40, "reasoning_output_tokens": 15, "non_reasoning_output_tokens": 25, "tool_calls": 2,
+        })
+
+    def test_codex_round_summary_preserves_missing_counters_and_rejects_wrong_cwd(self):
+        meta = {"type": "session_meta", "payload": {"cwd": "/tmp/trial"}}
+        for usage in (None, {"input_tokens": 100, "output_tokens": 0}):
+            with self.subTest(usage=usage):
+                rollout = self.write_rollout("missing-summary.jsonl", [meta, {
+                    "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage}},
+                }])
+                command = ["node", str(ROOT / "bin/codex-coord-stats.js"), "--round-summary", "--expect-cwd", "/tmp/trial", str(rollout)]
+                payload = json.loads(subprocess.run(command, text=True, capture_output=True, check=True).stdout)
+                for key in ("cached_input_tokens", "uncached_input_tokens", "reasoning_output_tokens", "non_reasoning_output_tokens"):
+                    self.assertIsNone(payload[key])
+                self.assertEqual(payload["output_tokens"], None if usage is None else 0)
+        for events in ([meta], [meta, {"type": "turn_context", "payload": {"cwd": "/tmp/other"}}]):
+            rollout = self.write_rollout("wrong-cwd.jsonl", events)
+            expected = "/tmp/wrong" if len(events) == 1 else "/tmp/trial"
+            result = subprocess.run(
+                ["node", str(ROOT / "bin/codex-coord-stats.js"), "--round-summary", "--expect-cwd", expected, str(rollout)],
+                text=True, capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("cwd", result.stderr)
+
+    def test_codex_round_summary_rejects_partial_json(self):
+        rollout = self.write_rollout("partial-summary.jsonl", [{"type": "session_meta", "payload": {"cwd": "/tmp/trial"}}])
+        with rollout.open("a") as stream:
+            stream.write('\n{"type":')
+        result = subprocess.run(
+            ["node", str(ROOT / "bin/codex-coord-stats.js"), "--round-summary", "--expect-cwd", "/tmp/trial", str(rollout)],
+            text=True, capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
 
     def test_codex_coord_stats_js_parses_current_token_count_rollouts(self):
         # Regression: the JS parser previously did not recognize the dominant

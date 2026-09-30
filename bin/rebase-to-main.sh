@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# rebase-to-main.sh — rebase a task worktree branch onto origin/main and force-push
+# rebase-to-main.sh — rebase a session worktree branch onto origin/main and force-push
 #
 # Exit codes:
 #   0  success — rebase and push complete; run merge-to-main.sh next
-#   1  conflicts — resolve manually, run git rebase --continue, then re-run this script
+#   1  conflicts — resolve manually, run git rebase --continue, then run the
+#      printed finish commands (a re-run would fail preflight: HEAD != upstream)
 #   2  preflight failure — wrong state, dirty tree, branch out of sync, etc.
 #
 # Environment:
@@ -28,9 +29,9 @@ MAIN_ROOT=$(cd "$MAIN_ROOT" && pwd -P)
 TASK_BRANCH=$(git -C "$TASK_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null) \
   || die "current worktree is detached; run this from a task branch"
 
-# ── 2. Guard: registered task worktree, not main ─────────────────────────────
+# ── 2. Guard: registered session worktree, not main ─────────────────────────────
 [[ "$TASK_ROOT" != "$MAIN_ROOT" && "$TASK_BRANCH" != "main" ]] \
-  || die "run this from a task worktree, not the main checkout"
+  || die "run this from a session worktree, not the main checkout"
 
 grep -qFx -- "$MAIN_ROOT" "$COORD_TOOLS/projects.txt" 2>/dev/null \
   || die "main checkout is not registered in $COORD_TOOLS/projects.txt: $MAIN_ROOT"
@@ -50,7 +51,7 @@ fi
 
 # ── 4. Dirty check ────────────────────────────────────────────────────────────
 [[ -z "$(git -C "$TASK_ROOT" status --porcelain)" ]] \
-  || die "task worktree is dirty; commit or clean it before rebasing"
+  || die "session worktree is dirty; commit or clean it before rebasing"
 [[ -z "$(git -C "$MAIN_ROOT" status --porcelain)" ]] \
   || die "main checkout is dirty; commit or clean it before rebasing"
 
@@ -83,14 +84,17 @@ if ! git -C "$TASK_ROOT" rebase origin/main; then
   printf 'Resolve each conflict, then:\n' >&2
   printf '  git add <resolved-path>\n' >&2
   printf '  git rebase --continue\n' >&2
-  printf 'Then re-run this script to verify and push.\n' >&2
+  printf 'Then finish by hand (do not re-run this script; its preflight needs HEAD == upstream):\n' >&2
+  printf '  git diff --check origin/main..HEAD\n' >&2
+  printf '  git push --force-with-lease=%s:%s origin HEAD:%s\n' \
+    "$TASK_UPSTREAM_BRANCH" "$TASK_UPSTREAM_COMMIT" "$TASK_UPSTREAM_BRANCH" >&2
   printf 'To abandon: git rebase --abort\n' >&2
   exit 1
 fi
 
 # ── 7. Post-rebase checks ─────────────────────────────────────────────────────
 git -C "$TASK_ROOT" diff --check origin/main..HEAD \
-  || die "whitespace errors in rebased branch; fix and re-run"
+  || die "whitespace errors in rebased branch; fix and commit, then: git push --force-with-lease=$TASK_UPSTREAM_BRANCH:$TASK_UPSTREAM_COMMIT origin HEAD:$TASK_UPSTREAM_BRANCH"
 
 # ── 8. Force-push ─────────────────────────────────────────────────────────────
 note "pushing $TASK_UPSTREAM_BRANCH with --force-with-lease..."

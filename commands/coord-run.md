@@ -13,15 +13,22 @@ Differences from `/coord-check`:
 1. Use `AGENT_ROLE=claude`.
 2. Do not run `precheck` or `pickup`; the task id is `$ARGUMENTS`.
 3. Start the read ladder at `coord show "$ARGUMENTS" --handoff`, then
-   `--compact`, `show-signatures`, targeted reads, and full `show` only if
-   still blocked.
-4. Capture `BASELINE` with `coord-tokens.sh --count` before marking the task
-   `claude-working`.
-5. Mark in progress with `coord update "$ARGUMENTS" --status=claude-working`,
-   then run `coord next-subtask "$ARGUMENTS"` and work only the returned
-   subtask when present.
-6. Write the round finding to `/tmp/claude-finding-$ARGUMENTS.txt`.
-7. Before the final update of the round (the status-changing call — never the
+   `--compact`, targeted reads, and full `show` only if
+   still blocked. The worker passes no packet, so read `round_role` from the
+   read-only `coord pickup --task-id="$ARGUMENTS" --assigned=claude` JSON; if
+   it returns `skip`, treat `status: needs-review` as `reviewer` and anything
+   else as `coder`.
+4. When `COORD_WRAPPER_TOKENS` is set, skip token capture entirely: the worker
+   records the complete run after exit. Otherwise capture `BASELINE` with
+   `coord-tokens.sh --count` before marking the task `claude-working`.
+5. Coder/architect rounds only: mark in progress with
+   `coord update "$ARGUMENTS" --status=claude-working`. Skip this for reviewer
+   rounds (`needs-review -> claude-working` is not an allowed transition and
+   exits 3). Then run `coord next-subtask "$ARGUMENTS"` and work only the
+   returned subtask when present.
+6. Write the round finding to `"${COORD_AGENT_FINDING_FILE:-/tmp/claude-finding-$ARGUMENTS.txt}"`.
+7. For manual runs only (`COORD_WRAPPER_TOKENS` unset), before the final
+   update of the round (the status-changing call — never the
    finding-only call in the reviewer 2-step pattern, since `--since=$BASELINE`
    is cumulative and would double-count), capture `TOKENS` with
    `coord-tokens.sh --since="$BASELINE"` and include

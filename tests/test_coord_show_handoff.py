@@ -31,8 +31,8 @@ class CoordShowHandoffTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def write_task(self, task_id, acceptance_yaml, verify_yaml=""):
-        body = textwrap.dedent("""\
+    def write_task(self, task_id, acceptance_yaml, verify_yaml="", frontmatter="", body=None):
+        body = body or textwrap.dedent("""\
             ## Task parameters
 
             ## Scope notes
@@ -57,6 +57,8 @@ class CoordShowHandoffTests(unittest.TestCase):
             lines.append(acceptance_yaml.rstrip("\n"))
         if verify_yaml:
             lines.append(verify_yaml.rstrip("\n"))
+        if frontmatter:
+            lines.append(frontmatter.rstrip("\n"))
         lines.append("---")
         lines.append(body)
         path = self.root / "tasks" / f"{task_id}.md"
@@ -66,6 +68,16 @@ class CoordShowHandoffTests(unittest.TestCase):
     def run_handoff(self, task_id):
         result = subprocess.run(
             ["python3", str(COORD), "show", task_id, "--handoff"],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout
+
+    def run_result(self, task_id):
+        result = subprocess.run(
+            ["python3", str(COORD), "show", task_id, "--result"],
             cwd=self.root,
             check=True,
             capture_output=True,
@@ -107,6 +119,103 @@ class CoordShowHandoffTests(unittest.TestCase):
         out = self.run_handoff("t-verify-scalar")
         self.assertIn("verify_commands:\n  - bash tests/test_thing.sh", out)
         self.assertNotIn("  - b\n  - a\n  - s\n  - h", out)
+
+    def test_result_view_reuses_handoff_and_adds_terminal_evidence(self):
+        body = textwrap.dedent("""\
+            ## Task parameters
+
+            ## Scope notes
+
+            - [x] **S1: Implement result view**
+              complexity: simple
+              model_claude: sonnet
+              model_codex: gpt-5.6-sol
+              Done.
+
+            - [x] **S2: Verify result view**
+              complexity: simple
+              model_claude: sonnet
+              model_codex: gpt-5.6-sol
+              Done.
+
+            ## Claude findings
+
+            ### Round 2
+
+            APPROVE — focused tests pass.
+
+            ## Codex findings
+
+            ### Round 1
+
+            Implemented the render path.
+
+            ## Plan
+            placeholder
+
+            ## Acceptance test
+            placeholder
+            """)
+        frontmatter = textwrap.dedent("""\
+            token_log:
+              - R1:S1:codex:10:2:3:15:0
+              - R2:review:claude:4:1:1:6:0""")
+        self.write_task(
+            "t-result",
+            "acceptance: Result view summarizes persisted evidence.",
+            "verify_commands: python3 -m pytest tests/test_coord_show_handoff.py",
+            frontmatter,
+            body,
+        )
+        handoff_dir = self.root / ".coord" / "handoffs" / "t-result"
+        handoff_dir.mkdir(parents=True)
+        (handoff_dir / "S2.md").write_text(
+            "# S2 handoff — t-result\nFinal handoff body.\n",
+            encoding="utf-8",
+        )
+
+        out = self.run_result("t-result")
+
+        self.assertIn("task: Handoff render test", out)
+        self.assertIn("acceptance:\n  - Result view summarizes persisted evidence.", out)
+        self.assertIn("verify_commands:\n  - python3 -m pytest tests/test_coord_show_handoff.py", out)
+        self.assertIn("latest_finding:\n  agent: claude\n  round: 2\n  terminal: yes", out)
+        self.assertIn("    APPROVE — focused tests pass.", out)
+        self.assertIn("final_handoff:\n```markdown\n# S2 handoff — t-result\nFinal handoff body.\n```", out)
+        self.assertIn("token_total: effective=21 (in=14 out=3 cache_read=4)", out)
+
+    def test_result_view_falls_back_to_latest_non_terminal_finding(self):
+        body = textwrap.dedent("""\
+            ## Task parameters
+
+            ## Scope notes
+
+            ## Claude findings
+
+            ### Round 1
+
+            Earlier review note.
+
+            ## Codex findings
+
+            ### Round 3
+
+            Latest implementation finding.
+
+            ## Plan
+            placeholder
+
+            ## Acceptance test
+            placeholder
+            """)
+        self.write_task("t-result-fallback", "", body=body)
+
+        out = self.run_result("t-result-fallback")
+
+        self.assertIn("latest_finding:\n  agent: codex\n  round: 3\n  terminal: no", out)
+        self.assertIn("    Latest implementation finding.", out)
+        self.assertNotIn("final_handoff:", out)
+        self.assertNotIn(".coord/handoffs", out)
 
 
 if __name__ == "__main__":

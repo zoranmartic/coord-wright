@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Compact, human-readable view of a project's .coord/worker.log.
+
+One line per round start and end: time, agent, model, task and subtask.
+Noise (repeated dirty-checkout ticks, git auth errors, pickup internals) is
+collapsed. The raw log is untouched; the watchdog and diagnostics keep
+parsing it.
+
+Usage: coord-log [PROJECT_DIR|LOG_FILE] [-n LINES] [--once]
+"""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+TS = re.compile(r"^\[(\d{4}-\d\d-\d\dT(\d\d:\d\d):\d\d[^\]]*)\] ?(.*)$")
+TASK = r"(\d{4}-\d\d-\d\d-[a-z0-9-]+)"
+COLOR = sys.stdout.isatty()
+
+
+def c(code, text):
+    return f"\033[{code}m{text}\033[0m" if COLOR else text
+
+
+def short_task(task_id, width=44):
+    name = task_id[11:] if re.match(r"\d{4}-\d\d-\d\d-", task_id) else task_id
+    return name if len(name) <= width else name[: width - 1] + "…"
+
+
+def short_model(model):
+    """Model family only: claude-sonnet-5 -> sonnet, gpt-5.6-sol -> sol."""
+    m = re.match(r"claude-([a-z]+)", model)
+    if m:
+        return m.group(1)
+    m = re.match(r"gpt-[\d.]+-([a-z]+)$", model)
+    return m.group(1) if m else model
+
+
+EFFORT = {"medium": "med", "xhigh": "xhi"}
+
+
+def width():
+    return shutil.get_terminal_size((100, 24)).columns
+
+
+def fmt_duration(seconds):
+    if seconds is None:
+        return ""
+    return f"{seconds // 60}m{seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
+
+
+def epoch(stamp):
+    try:
+        return int(time.mktime(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S")))
+    except ValueError:
+        return None
+
+
+class View:
+    def __init__(self, project_dir, live):
+        self.project_dir = project_dir
+        self.live = live
+        self.hhmm = "--:--"
+        self.stamp = None
+        self.round = {}
+        self.quiet = None  # collapsed repeating condition currently shown
+
+    def emit(self, text, running=False):
+        if text == getattr(self, "last", None):
+            return
+        # A finished round replaces its own "▶ running" line when that is still
+        # the last line on screen, so a stale marker never looks like a second
+        # concurrent round.
+        if COLOR and getattr(self, "running_shown", False) and not running:
+            print("\033[1A\033[2K", end="")
+        self.running_shown = running
+        self.last = text
+        print(f"{c('2', self.hhmm)} {text}", flush=True)
+
+    @staticmethod
+    def cols(r, sub, tail):
+        """Agent, model, task (fills the pane width), subtask, then tail."""
+        fixed = 6 + 1 + 6 + 1 + 9 + 1 + 1 + 6 + 1 + max(14, len(tail))
+        task_w = max(16, width() - fixed)
+        return (f"{r.get('agent', '?'):<6} {r.get('model', ''):<9} "
+                f"{short_task(r.get('task', ''), task_w):<{task_w}} "
+                f"{c('1', (sub or '').ljust(6))} "
+                + (f"{c('2', tail[:-8])} {c('32', '✓verify')}" if tail.endswith(" ✓verify") else c('2', tail)))
+
+    def collapse(self, key, text):
+        if self.quiet != key:
+            self.quiet = key
+            self.emit(text)
+
+    def subtask_now(self, task_id):
+        if not self.live:
+            return ""
+        tools = os.environ.get("COORD_TOOLS", os.path.expanduser("~/Projects/coord-wright"))
+        try:
+            out = subprocess.run(
+                [sys.executable, os.path.join(tools, "bin", "coord"), "next-subtask", task_id],
+                cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        first = out.split("\t", 1)[0].strip()
+        return first if re.fullmatch(r"S\d+", first) else ""
+
+    def line(self, raw):
+        m = TS.match(raw)
+        if m:
+            self.stamp, self.hhmm, body = m.group(1), m.group(2), m.group(3)
+        else:
+            body = raw.strip()
+        if not body:
+            return
+
+        if body.startswith("git sync skipped: worktree dirty"):
+            return self.collapse("dirty", c("33", "⏸ main checkout dirty, worker waiting"))
+        if body.startswith("fatal: unable to access") or body.startswith("fatal: could not read Username"):
+            return self.collapse("git", c("33", "⚠ git fetch/push failed (network or auth)"))
+
+        m = re.match(rf"tick: running {TASK} with (\w+)", body)
+        if m:
+            self.quiet = None
+            self.round = {"task": m.group(1), "agent": m.group(2), "start": epoch(self.stamp or "")}
+            return
+        m = re.match(r"pickup: role=(\S+) model=(\S+) .*?reasoning=(\S+)", body)
+        if m and self.round:
+            role, model, effort = m.groups()
+            r = self.round
+            r["role"], r["model"] = role, f"{short_model(model)}·{EFFORT.get(effort, effort)}"
+            if role == "reviewer":
+                r["label"] = "review"
+            elif role == "architect":
+                r["label"] = "design"
+            if self.live:
+                sub = r.get("label") or self.subtask_now(r["task"])
+                self.emit(f"{c('36', '▶')} {self.cols(r, sub, 'running')}", running=True)
+            return
+        m = re.match(r"agent output: (\d+) (message|line)", body)
+        if m and self.round:
+            n, kind = m.group(1), "msg" if m.group(2) == "message" else "line"
+            self.round["msgs"] = f"{n} {kind}" + ("" if n == "1" else "s")
+            return
+        m = re.match(rf"tokens reported for {TASK} \((\w+) (\S+)\)", body)
+        if m and self.round:
+            self.round.setdefault("label", m.group(3))
+            return
+        if body.startswith("mechanical verify gate"):
+            self.round["verify"] = "passed" in body
+            if "passed" not in body:
+                self.emit(c("31", "✗ verify gate failed"))
+            return
+        m = re.match(rf"round token budget warn for {TASK}: effective=(\d+)", body)
+        if m:
+            self.emit(c("33", f"⚠ round used {int(m.group(2)) / 1e6:.1f}M tokens (over warn)"))
+            return
+        m = re.match(rf"tick: done {TASK} with (\w+)", body)
+        if m:
+            if self.round.get("task") != m.group(1):
+                if not self.live:
+                    return  # history began mid-round; nothing useful to show
+                self.round = {"task": m.group(1), "agent": m.group(2)}
+            r = self.round
+            end = epoch(self.stamp or "")
+            dur = end - r["start"] if end and r.get("start") else None
+            tail = fmt_duration(dur)
+            if r.get("msgs") and width() >= 120:
+                tail += f" · {r['msgs']}"
+            if r.get("verify"):
+                tail += " ✓verify"
+            self.emit(f"{c('32', '✓')} {self.cols(r, r.get('label', ''), tail)}")
+            self.round = {}
+            return
+        m = re.match(rf"tick failed rc=(\d+) for {TASK}", body)
+        if m:
+            self.emit(c("31", f"✗ failed rc={m.group(1)}  {short_task(m.group(2))}  → needs human review"))
+            self.round = {}
+            return
+        m = re.match(rf"rate-limited; restored {TASK}", body)
+        if m:
+            self.emit(c("33", f"⏸ rate-limited, requeued {short_task(m.group(1))}"))
+            self.round = {}
+            return
+        if "needs-brainstorming" in body:
+            m = re.search(TASK, body)
+            self.emit(c("31", "✗ needs-brainstorming" + (f"  {short_task(m.group(1))}" if m else "")))
+
+
+def tail_lines(path, count):
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        block, data = 65536, b""
+        while size > 0 and data.count(b"\n") <= count:
+            step = min(block, size)
+            size -= step
+            fh.seek(size)
+            data = fh.read(step) + data
+    return data.decode("utf-8", "replace").splitlines()[-count:]
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("target", nargs="?", default=".", help="project dir or worker.log path")
+    ap.add_argument("-n", type=int, default=400, help="raw history lines to render first")
+    ap.add_argument("--once", action="store_true", help="render history and exit")
+    args = ap.parse_args()
+
+    path = args.target
+    if os.path.isdir(path):
+        path = os.path.join(path, ".coord", "worker.log")
+    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(path)))
+    while not os.path.exists(path):
+        if args.once:
+            sys.exit(f"no log at {path}")
+        time.sleep(2)
+
+    view = View(project_dir, live=False)
+    for raw in tail_lines(path, args.n):
+        view.line(raw)
+    view.live = True
+    r = view.round
+    if r.get("model"):
+        sub = r.get("label") or view.subtask_now(r["task"])
+        view.emit(f"{c('36', '▶')} {view.cols(r, sub, 'running')}", running=True)
+    if args.once:
+        return
+    fh = open(path, "r", errors="replace")
+    fh.seek(0, os.SEEK_END)
+    inode = os.fstat(fh.fileno()).st_ino
+    buf = ""
+    try:
+        while True:
+            chunk = fh.read()
+            if chunk:
+                buf += chunk
+                *done, buf = buf.split("\n")
+                for raw in done:
+                    view.line(raw)
+                continue
+            time.sleep(1)
+            try:
+                st = os.stat(path)
+            except FileNotFoundError:
+                continue
+            if st.st_ino != inode or st.st_size < fh.tell():
+                fh.close()
+                fh = open(path, "r", errors="replace")
+                inode = os.fstat(fh.fileno()).st_ino
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

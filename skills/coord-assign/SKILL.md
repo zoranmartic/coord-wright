@@ -35,13 +35,13 @@ Project-root preflight:
    - `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" update <id> --assigned=<agent> --agents=<agent>`
    - `coord update --agents` sets the `agents:` frontmatter field through the CLI; no direct file edits needed.
    - For `roles.coder`: read the current roles map from `coord show <id>`, build a merged spec preserving all existing keys (e.g. `reviewer:claude`), then apply: `coord update <id> --roles=coder:<agent>,reviewer:<existing-reviewer>`. Only include keys that were already present. Skip `--roles` entirely if the task has no `roles:` block.
-   - Also remove any stale `shape_override: route back to <old-agent>` text via `coord update` if present.
    - `roles.reviewer` is intentionally left as-is (often stays `claude` for review quality even on codex-coder tasks).
    - Each `coord update` call auto-commits-and-pushes. Do not run manual `git add`, `git commit`, or `git push`.
 
 4. **Apply the model change** (if `--model` supplied).
    - **Task-level (no subtask list):**
      `python3 "${COORD_TOOLS:-$HOME/Projects/coord-wright}/bin/coord" update <id> --model_<agent>=<value>`
+     If it exits 3 as off-baseline for the task's `complexity`, report and stop; move the task to another rung only after the user agrees, by changing `complexity` in the same call (`--complexity=simple --model_claude=sonnet`).
    - **Per-subtask:**
      - Read current subtasks block from the task path returned by `coord show <id> --path` (the `### Subtasks` checklist under `## Scope notes`).
      - For each named `S<n>`, replace its `model_<agent>:` line with the new value (or insert one if missing).
@@ -56,6 +56,5 @@ Project-root preflight:
 ## Rules
 
 - Never touch `status`. If the user wants to kick a stuck loop, that is `/coord-requeue`.
-- Never use `--force`, `--no-verify`, or `--shape-override`.
+- Never use `--force` or `--no-verify`.
 - Cross-agent subtask routing (S3 on a different agent than the task) is intentionally not supported — recommend `/coord-split` instead.
-- Stage only the task path returned by `coord show <id> --path`.

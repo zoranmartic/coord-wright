@@ -16,7 +16,7 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 127
 fi
 
-mkdir -p "$CLAUDE_DIR/agents" "$CLAUDE_DIR/commands" "$CLAUDE_DIR/skills" "$LAUNCHD_DIR"
+mkdir -p "$CLAUDE_DIR/commands" "$CLAUDE_DIR/skills" "$LAUNCHD_DIR"
 
 link() {
   local src="$1" dst="$2"
@@ -129,9 +129,6 @@ is_tracked() {
   git -C "$worktree" ls-files --error-unmatch "$path" >/dev/null 2>&1
 }
 
-for f in "$TOOLS"/agents/*.md; do
-  link "$f" "$CLAUDE_DIR/agents/$(basename "$f")"
-done
 
 for f in "$TOOLS"/commands/*.md; do
   link "$f" "$CLAUDE_DIR/commands/$(basename "$f")"

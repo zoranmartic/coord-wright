@@ -156,6 +156,27 @@ def test_pickup_skips_unchanged_task_when_no_subtasks_remain(coord_repo):
     assert payload == {"decision": "skip", "reason": "no runnable task for codex"}
 
 
+def test_pickup_skips_after_finding_then_token_update(coord_repo):
+    path = coord_repo.tasks["pending"]
+    fm, body = parse_task(path)
+    body = body.replace("- [ ] **S1:", "- [x] **S1:")
+    write_task(path, fm, body)
+
+    finding = coord_repo.coord(
+        "update", "sample-pending", "--append-codex-finding=Completed fixture."
+    )
+    tokens = coord_repo.coord(
+        "update", "sample-pending", '--add-tokens-codex={"input": 1, "output": 2}'
+    )
+    pickup = coord_repo.coord("pickup", "--assigned=codex", "--task-id=sample-pending")
+
+    assert finding.returncode == 0, finding.stderr
+    assert tokens.returncode == 0, tokens.stderr
+    assert json.loads(pickup.stdout) == {
+        "decision": "skip", "reason": "no runnable task for codex"
+    }
+
+
 def test_pickup_runs_unchanged_task_when_subtasks_remain(coord_repo):
     path = coord_repo.tasks["pending"]
     fm, body = parse_task(path)

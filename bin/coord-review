@@ -15,6 +15,7 @@ Checks:
   3. Model check   — model_claude / model_codex must be on the allowlist
   4. High-risk     — tasks with money/auth/security/destructive keywords must be
                      complex + review_rounds_max >= 2
+  5. Subtraction   — four recorded answers and a numeric net LOC budget
 """
 from __future__ import annotations
 
@@ -225,6 +226,39 @@ def check_high_risk(front: dict) -> list[str]:
     return objections
 
 
+def check_subtraction(front: dict, body: str) -> list[str]:
+    objections = []
+    analysis = _section(body, "Subtraction analysis")
+    entries = re.findall(
+        r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+(.*)$",
+        analysis,
+        re.MULTILINE,
+    )
+    placeholders = {"", "todo", "tbd", "unknown", "i don't know", "fill me in"}
+    if len(entries) != 4 or any(
+        re.split(r"[:?]", entry)[-1].strip().strip("*_` .").lower() in placeholders
+        for entry in entries
+    ):
+        objections.append(
+            "Subtraction analysis must record four non-placeholder list answers: "
+            "deletion alternative, orphaned code, net LOC band, and retirement "
+            "or a concrete reason for growth. Add a `### Subtraction analysis` "
+            "sub-heading after the opening prose of the plan file and write it with "
+            "`coord update --set-plan=@<file>` (a `## ` heading in a plan file is "
+            "duplicated by every --set-plan rerun)."
+        )
+
+    budget = front.get("scope_budget")
+    band = budget.get("net_loc_delta_target") if isinstance(budget, dict) else None
+    if not isinstance(band, str) or not re.fullmatch(r"[+-]?\d+\s+to\s+[+-]?\d+", band.strip()):
+        objections.append(
+            "scope_budget.net_loc_delta_target must be a numeric band "
+            "(for example '+50 to +200', '0 to 0', or '-800 to -1200'). "
+            "Set it with `coord update --scope-budget-loc=<band>`."
+        )
+    return objections
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -248,6 +282,7 @@ def main() -> int:
     all_objections.extend(check_combo(front))
     all_objections.extend(check_models(front))
     all_objections.extend(check_high_risk(front))
+    all_objections.extend(check_subtraction(front, body))
 
     if not all_objections:
         print("LGTM — no shaping objections found.")
